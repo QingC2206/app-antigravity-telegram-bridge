@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "app-antigravity-telegram-bridge"
+dynamic = ["version"]
+description = "Telegram notifications, task control, and artifacts bridge for Google Antigravity"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+  "psutil>=6.1,<8",
+  "jsonschema>=4.23,<5",
+  "keyring>=25,<26",
+  "tomlkit>=0.13,<1",
+  "mss>=10,<11",
+  "pyobjc-framework-Quartz>=10; sys_platform == 'darwin'",
+  "dbus-next>=0.2.3; sys_platform == 'linux'",
+  "python-xlib>=0.33; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "wheel", "packaging>=23"]
+
+[project.scripts]
+antigravity-telegram-bridge = "antigravity_telegram_bridge.cli:main"
+agy-telegram-bridge = "antigravity_telegram_bridge.cli:main"
+codex-telegram-bridge = "antigravity_telegram_bridge.cli:main"
+
+[project.urls]
+Repository = "https://github.com/QingC2206/app-antigravity-telegram-bridge"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "antigravity_telegram_bridge.__version__"}
+
+[tool.setuptools.package-data]
+antigravity_telegram_bridge = ["resources/*.json", "resources/bundled_plugins/*/*.json", "resources/bundled_plugins/*/*.py"]

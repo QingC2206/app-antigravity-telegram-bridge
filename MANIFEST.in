@@ -1,0 +1,6 @@
+include README.md README.en.md LICENSE SECURITY.md CHANGELOG.md install.py pyproject.toml
+recursive-include docs *.md
+recursive-include tools *.py
+recursive-include tests *.py
+recursive-include src/antigravity_telegram_bridge *.py *.json
+global-exclude *.pyc *.log *.sqlite* *.db *.credentials.json *.validation.json

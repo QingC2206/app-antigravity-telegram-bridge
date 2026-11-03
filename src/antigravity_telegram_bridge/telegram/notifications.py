@@ -1,0 +1,2440 @@
+#!/usr/bin/env python3
+"""Deliver verified Desktop conversation completions from notify/lifecycle hooks.
+
+Tokens use the selected operating system's secure credential storage.
+The hook never writes notification output to stdout.
+"""
+
+from __future__ import annotations
+from antigravity_telegram_bridge.i18n import tr as _t
+
+import base64
+from datetime import datetime
+import getpass
+import html
+import json
+import os
+from pathlib import Path, PureWindowsPath
+import re
+import secrets
+import sqlite3
+import subprocess
+import sys
+import time
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+import antigravity_telegram_bridge.codex.receipts as desktop_receipts
+import antigravity_telegram_bridge.telegram.local_images as local_images
+from ..paths import data_dir, codex_home
+from ..config import store_token, load_token
+HOOK_DIR = data_dir()
+CONFIG_PATH = HOOK_DIR / "telegram_notify.credentials.json"
+LOG_PATH = HOOK_DIR / "telegram_notify.log"
+BOT_STATE_PATH = HOOK_DIR / "telegram_bot.state.json"
+REPLY_CACHE_DIR = HOOK_DIR / "telegram_replies"
+SESSION_ROOT = codex_home() / "sessions"
+# An installed hook is bound to its own credentials/profile, including isolated
+# Desktop instances. Development copies use the explicitly selected Codex home.
+SOURCE_STATE_ROOT = codex_home()
+MAX_TELEGRAM_MESSAGE = 3900
+REPLY_PREVIEW_LIMIT = 1600
+REPLY_PAGE_LIMIT = 3300
+REPLY_RETENTION_SECONDS = 7 * 24 * 60 * 60
+MAX_CACHED_REPLY_BYTES = 48 * 1024 * 1024
+
+
+REACTION_DB = HOOK_DIR / "telegram_reactions.sqlite3"
+
+
+def workspace_name(cwd):
+    if not cwd:
+        return _t('未知工作区')
+    # History may contain Windows workspaces even when viewed on another OS.
+    path = PureWindowsPath(cwd)
+    return path.name if path.drive else Path(cwd).name
+
+
+def _reaction_db(*, timeout=30):
+    db = sqlite3.connect(REACTION_DB, timeout=timeout)
+    db.execute("CREATE TABLE IF NOT EXISTS reactions (bot TEXT, chat TEXT, message INTEGER, thread TEXT, turn TEXT, emoji TEXT, updated REAL, PRIMARY KEY(bot, chat, message))")
+    db.execute("CREATE TABLE IF NOT EXISTS reaction_delivered (bot TEXT, thread TEXT, turn TEXT, updated REAL, PRIMARY KEY(bot, thread, turn))")
+    db.execute("CREATE TABLE IF NOT EXISTS reaction_outcomes (bot TEXT, thread TEXT, turn TEXT, emoji TEXT, PRIMARY KEY(bot, thread, turn))")
+    db.execute("CREATE TABLE IF NOT EXISTS task_reply_sources (bot TEXT, chat TEXT, thread TEXT, turn TEXT, message INTEGER, updated REAL, PRIMARY KEY(bot,chat,thread,turn))")
+    db.execute("CREATE TABLE IF NOT EXISTS desktop_submissions (bot TEXT,chat TEXT,message INTEGER,thread TEXT,path TEXT,offset INTEGER,digest TEXT,created REAL,turn TEXT,item TEXT, PRIMARY KEY(bot,chat,message))")
+    db.execute("CREATE TABLE IF NOT EXISTS reaction_retries (bot TEXT,chat TEXT,message INTEGER, PRIMARY KEY(bot,chat,message))")
+    db.execute("CREATE TABLE IF NOT EXISTS reaction_results (bot TEXT,chat TEXT,message INTEGER,applied INTEGER NOT NULL, PRIMARY KEY(bot,chat,message))")
+    db.execute("CREATE TABLE IF NOT EXISTS navigation_roots (bot TEXT, chat TEXT, origin INTEGER, panel INTEGER, status TEXT, PRIMARY KEY(bot,chat,origin))")
+    db.execute("CREATE TABLE IF NOT EXISTS navigation_views (bot TEXT, chat TEXT, panel INTEGER, origin INTEGER, status TEXT, revision INTEGER, PRIMARY KEY(bot,chat,panel))")
+    db.execute("CREATE TABLE IF NOT EXISTS navigation_list_returns (bot TEXT, chat TEXT, panel INTEGER, target TEXT, PRIMARY KEY(bot,chat,panel))")
+    return db
+
+
+def navigation_view(token, chat, panel):
+    db = _reaction_db()
+    try:
+        row = db.execute("SELECT origin,status,revision FROM navigation_views WHERE bot=? AND chat=? AND panel=?",
+                         (token.split(':')[0], str(chat), panel)).fetchone()
+        return dict(origin=row[0], status=row[1], revision=row[2]) if row else None
+    finally:
+        db.close()
+
+
+def navigation_list_return(token, chat, panel, target=None):
+    if not panel:
+        return None
+    db = _reaction_db()
+    key = (token.split(':')[0], str(chat), panel)
+    try:
+        if target is not None:
+            with db:
+                db.execute('INSERT OR REPLACE INTO navigation_list_returns VALUES(?,?,?,?)',(*key,target))
+        row = db.execute('SELECT target FROM navigation_list_returns WHERE bot=? AND chat=? AND panel=?',key).fetchone()
+        return row[0] if row else None
+    finally:
+        db.close()
+
+
+def reserve_navigation(token, chat, origin):
+    db = _reaction_db()
+    key = (token.split(':')[0], str(chat), origin)
+    try:
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT panel,status FROM navigation_roots WHERE bot=? AND chat=? AND origin=?',key).fetchone()
+            if row and row[1] != 'closed':
+                return False, row[0]
+            db.execute('INSERT OR REPLACE INTO navigation_roots VALUES(?,?,?,NULL,?)',(*key,'creating'))
+            return True, None
+    finally:
+        db.close()
+
+
+def bind_navigation(token, chat, origin, panel):
+    db = _reaction_db()
+    key = (token.split(':')[0], str(chat))
+    try:
+        with db:
+            db.execute('UPDATE navigation_roots SET panel=?,status=? WHERE bot=? AND chat=? AND origin=?',
+                       (panel,'open',*key,origin))
+            db.execute('INSERT INTO navigation_views VALUES(?,?,?,?,?,0)',(*key,panel,origin,'open'))
+    finally:
+        db.close()
+
+
+def release_navigation(token, chat, origin):
+    # Only explicit API rejection permits another create; timeouts remain reserved.
+    db = _reaction_db()
+    try:
+        with db:
+            db.execute("DELETE FROM navigation_roots WHERE bot=? AND chat=? AND origin=? AND status='creating' AND panel IS NULL",
+                       (token.split(':')[0],str(chat),origin))
+    finally:
+        db.close()
+
+
+def advance_navigation(token, chat, panel, *, close=False):
+    db = _reaction_db()
+    key = (token.split(':')[0],str(chat),panel)
+    try:
+        with db:
+            db.execute("UPDATE navigation_views SET revision=revision+1,status=? WHERE bot=? AND chat=? AND panel=? AND status='open'",
+                       ('closed' if close else 'open',*key))
+            if close:
+                db.execute("UPDATE navigation_roots SET status='closed' WHERE bot=? AND chat=? AND panel=?",key)
+    finally:
+        db.close()
+
+
+def remember_task_reply_source(token, chat_id, thread_id, turn_id, message_id):
+    if not thread_id or not turn_id or not isinstance(message_id, int) or message_id <= 0:
+        return
+    db = _reaction_db()
+    try:
+        with db:
+            db.execute("INSERT INTO task_reply_sources VALUES(?,?,?,?,?,?) "
+                       "ON CONFLICT(bot,chat,thread,turn) DO UPDATE SET "
+                       "message=excluded.message,updated=excluded.updated "
+                       "WHERE excluded.message>=task_reply_sources.message",
+                       (token.split(":")[0], str(chat_id), thread_id, turn_id, message_id, time.time()))
+            db.execute("DELETE FROM task_reply_sources WHERE updated<?", (time.time()-30*86400,))
+    finally:
+        db.close()
+
+
+def task_reply_source(token, chat_id, thread_id, turn_id):
+    # Never fall back to a different turn, task, chat or bot.
+    if not thread_id or not turn_id:
+        return None
+    db = _reaction_db()
+    key = (token.split(":")[0], str(chat_id), thread_id, turn_id)
+    try:
+        row = db.execute("SELECT message FROM task_reply_sources WHERE bot=? AND chat=? AND thread=? AND turn=? AND updated>?",
+                         (*key, time.time()-30*86400)).fetchone()
+        if row:
+            return int(row[0])
+        # Compatible with a turn already running when this version was installed.
+        row = db.execute("SELECT message FROM reactions WHERE bot=? AND chat=? AND thread=? AND turn=? AND updated>? ORDER BY message DESC LIMIT 1",
+                         (*key, time.time()-30*86400)).fetchone()
+        return int(row[0]) if row else None
+    finally:
+        db.close()
+
+
+def attach_task_reply(token, request, thread_id, turn_id):
+    if request.get("reply_parameters"):
+        return
+    try:
+        message_id = task_reply_source(token, request.get("chat_id"), thread_id, turn_id)
+        if message_id:
+            request["reply_parameters"] = {"message_id": message_id, "allow_sending_without_reply": True}
+    except Exception as exc:
+        log_error(f"could not associate completion reply: {type(exc).__name__}")
+
+
+def set_task_reaction(token, chat_id, message_id, emoji, thread_id="", turn_id="", *, _retry=False, api=None):
+    """Serialize desired state and Telegram writes across bot and hook processes."""
+    emoji = {"👌": "🎉", "👎": "😢"}.get(emoji, emoji)
+    if not message_id:
+        return False
+    db = _reaction_db()
+    bot = token.split(":")[0]
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        # Retain retry state from older installations with the new supported icons.
+        db.execute("UPDATE reactions SET emoji=CASE emoji WHEN '👌' THEN '🎉' ELSE '😢' END WHERE bot=? AND emoji IN ('👌','👎')", (bot,))
+        previous = db.execute("SELECT thread,turn,emoji,updated FROM reactions WHERE bot=? AND chat=? AND message=?",
+                              (bot, str(chat_id), message_id)).fetchone()
+        if _retry and (not previous or previous[:3] != (thread_id, turn_id, emoji)):
+            # A hook may have completed the message since the retry was queued.
+            return False
+        if emoji in {"👀", "🤔"} and turn_id and db.execute("SELECT 1 FROM reaction_delivered WHERE bot=? AND thread=? AND turn=?", (bot, thread_id, turn_id)).fetchone():
+            outcome = db.execute('SELECT emoji FROM reaction_outcomes WHERE bot=? AND thread=? AND turn=?', (bot, thread_id, turn_id)).fetchone()
+            emoji = outcome[0] if outcome else '🎉'
+        if previous and previous[:3] == (thread_id, turn_id, emoji) and not db.execute(
+                "SELECT 1 FROM reaction_retries WHERE bot=? AND chat=? AND message=?", (bot, str(chat_id), message_id)).fetchone():
+            # Desired state alone is not an acknowledgement. In particular,
+            # a definitive 400 must not suppress the text submission receipt.
+            result = db.execute("SELECT applied FROM reaction_results WHERE bot=? AND chat=? AND message=?",
+                                (bot, str(chat_id), message_id)).fetchone()
+            if result is not None:
+                return bool(result[0])
+        updated = previous[3] if previous and previous[:3] == (thread_id, turn_id, emoji) else time.time()
+        db.execute("INSERT OR REPLACE INTO reactions VALUES (?,?,?,?,?,?,?)", (bot, str(chat_id), message_id, thread_id, turn_id, emoji, updated))
+        db.execute("DELETE FROM reaction_results WHERE bot=? AND chat=? AND message=?", (bot, str(chat_id), message_id))
+        try:
+            (api or telegram_call)(token, "setMessageReaction", {
+                "chat_id": str(chat_id), "message_id": message_id,
+                "reaction": [{"type": "emoji", "emoji": emoji}] if emoji else [],
+                "is_big": False,
+            }, timeout=8)
+        except Exception as exc:
+            log_error(f"reaction update failed: {exc}", token)
+            db.execute("INSERT OR REPLACE INTO reaction_results VALUES (?,?,?,0)", (bot, str(chat_id), message_id))
+            if 'Telegram API 400:' not in str(exc):
+                db.execute("INSERT OR IGNORE INTO reaction_retries VALUES (?,?,?)", (bot, str(chat_id), message_id))
+            else:
+                db.execute("DELETE FROM reaction_retries WHERE bot=? AND chat=? AND message=?", (bot, str(chat_id), message_id))
+                if emoji in {"", "🎉", "😢"}:
+                    db.execute("DELETE FROM reactions WHERE bot=? AND chat=? AND message=?", (bot, str(chat_id), message_id))
+                    db.execute("DELETE FROM reaction_results WHERE bot=? AND chat=? AND message=?", (bot, str(chat_id), message_id))
+            db.commit()
+            return False
+        db.execute("DELETE FROM reaction_retries WHERE bot=? AND chat=? AND message=?", (bot, str(chat_id), message_id))
+        db.execute("INSERT OR REPLACE INTO reaction_results VALUES (?,?,?,1)", (bot, str(chat_id), message_id))
+        if not emoji or emoji in {"🎉", "😢"}:
+            # Forget local work after success; Telegram keeps the OK reaction.
+            db.execute("DELETE FROM reactions WHERE bot=? AND chat=? AND message=?", (bot, str(chat_id), message_id))
+            db.execute("DELETE FROM reaction_results WHERE bot=? AND chat=? AND message=?", (bot, str(chat_id), message_id))
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
+def task_reactions(token):
+    db = _reaction_db()
+    try:
+        return db.execute("SELECT chat,message,thread,turn,emoji,updated FROM reactions WHERE bot=?", (token.split(":")[0],)).fetchall()
+    finally:
+        db.close()
+
+
+def retry_task_reactions(token, *, api=None):
+    db = _reaction_db()
+    try:
+        rows = db.execute("SELECT r.chat,r.message,r.thread,r.turn,r.emoji FROM reactions r JOIN reaction_retries q "
+                          "ON r.bot=q.bot AND r.chat=q.chat AND r.message=q.message WHERE r.bot=?",
+                          (token.split(':')[0],)).fetchall()
+    finally:
+        db.close()
+    for chat, message, thread, turn, emoji in rows:
+        set_task_reaction(token, chat, message, emoji, thread, turn, _retry=True,
+                          **({'api': api} if api else {}))
+
+
+def remember_desktop_submission(token, chat, message, thread, text):
+    if not isinstance(message, int) or message <= 0:
+        return False
+    path, offset = desktop_receipts.checkpoint(thread, SESSION_ROOT)
+    db = _reaction_db()
+    try:
+        with db:
+            db.execute("INSERT OR REPLACE INTO desktop_submissions VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       (token.split(':')[0], str(chat), message, thread, path, offset,
+                        desktop_receipts.prompt_digest(thread, text), time.time(), '', ''))
+            db.execute("DELETE FROM desktop_submissions WHERE created<?", (time.time()-30*86400,))
+        return True
+    finally:
+        db.close()
+
+
+def desktop_submission_turn(token, chat, message, thread):
+    db = _reaction_db()
+    try:
+        row = db.execute("SELECT turn FROM desktop_submissions WHERE bot=? AND chat=? AND message=? AND thread=?",
+                         (token.split(':')[0], str(chat), message, thread)).fetchone()
+        return row[0] if row else None  # empty string denotes an unbound receipt
+    finally:
+        db.close()
+
+
+def desktop_submission_receipt(token, chat, message, thread):
+    """Only a matched rollout item proves receipt; an RPC turn ID alone does not."""
+    db = _reaction_db(timeout=0)
+    try:
+        row = db.execute("SELECT turn,item FROM desktop_submissions WHERE bot=? AND chat=? AND message=? AND thread=?",
+                         (token.split(':')[0], str(chat), message, thread)).fetchone()
+        return {'turn_id': row[0], 'item_id': row[1]} if row and all(row) else None
+    finally:
+        db.close()
+
+
+def forget_desktop_submission(token, chat, message, thread):
+    db = _reaction_db()
+    try:
+        with db:
+            db.execute("DELETE FROM desktop_submissions WHERE bot=? AND chat=? AND message=? AND thread=? AND turn=''",
+                       (token.split(':')[0], str(chat), message, thread))
+    finally:
+        db.close()
+
+
+def bind_desktop_submission(token, chat, message, thread, turn, item='', *, update_reaction=True):
+    if not turn:
+        return False
+    bot = token.split(':')[0]
+    db = _reaction_db(timeout=30 if update_reaction else 0)
+    try:
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            if item and db.execute("SELECT 1 FROM desktop_submissions WHERE bot=? AND thread=? AND item=?",
+                                   (bot, thread, item)).fetchone():
+                return False
+            changed = db.execute("UPDATE desktop_submissions SET turn=?,item=? WHERE bot=? AND chat=? AND message=? AND thread=? AND turn=''",
+                                 (turn, item, bot, str(chat), message, thread)).rowcount
+            if not changed:
+                return False
+            db.execute("INSERT INTO task_reply_sources VALUES(?,?,?,?,?,?) ON CONFLICT(bot,chat,thread,turn) "
+                       "DO UPDATE SET message=excluded.message,updated=excluded.updated WHERE excluded.message>=task_reply_sources.message",
+                       (bot, str(chat), thread, turn, message, time.time()))
+            db.execute("UPDATE reactions SET thread=?,turn=? WHERE bot=? AND chat=? AND message=?",
+                       (thread, turn, bot, str(chat), message))
+        # The rollout receipt is proof of acceptance, even if the sender has
+        # not received its acknowledgement or the completion hook is very fast.
+        if update_reaction:
+            set_task_reaction(token, chat, message, '🤔', thread, turn)
+        return True
+    finally:
+        db.close()
+
+
+def resolve_desktop_submissions(token, thread_id=None, *, update_reactions=True, deadline=None):
+    db = _reaction_db(timeout=30 if update_reactions else 0)
+    bot = token.split(':')[0]
+    try:
+        query = "SELECT chat,message,thread,path,offset,digest,created FROM desktop_submissions WHERE bot=? AND turn='' AND created>?"
+        params = [bot, time.time()-86400]
+        if thread_id:
+            query += " AND thread=?"; params.append(thread_id)
+        rows = db.execute(query + " ORDER BY created,message LIMIT 50", params).fetchall()
+    finally:
+        db.close()
+    for chat, message, thread, stored_path, offset, digest, created in rows:
+        if deadline is not None and time.monotonic() > deadline:
+            break
+        try:
+            stored_offset = offset
+            path = desktop_receipts.session_path(thread, SESSION_ROOT)
+            if path is None:
+                continue
+            if stored_path and str(path) != stored_path:
+                offset = 0  # e.g. Desktop unarchived the same task; require a fresh timestamp below.
+            receipts, next_offset = desktop_receipts.read_receipts(path, offset)
+            for receipt in receipts:
+                if not isinstance(receipt['created'], (int, float)) or receipt['created'] < created:
+                    continue
+                if receipt['digest'] == digest and bind_desktop_submission(token, chat, message, thread, receipt['turn_id'], receipt['item_id'], update_reaction=update_reactions):
+                    break
+            else:
+                db = _reaction_db(timeout=30 if update_reactions else 0)
+                try:
+                    with db:
+                        db.execute("UPDATE desktop_submissions SET path=?,offset=? WHERE bot=? AND chat=? AND message=? AND turn='' AND offset=?",
+                                   (str(path), next_offset, bot, str(chat), message, stored_offset))
+                finally:
+                    db.close()
+        except (OSError, sqlite3.Error) as exc:
+            log_error(f"Desktop reply association failed: {type(exc).__name__}")
+
+
+def resolve_desktop_history_submissions(token, thread_id, history, *, expected_turn_id='', deadline=None):
+    """Correlate live receipts in journal order, without network writes."""
+    receipts = desktop_receipts.native_start_receipts(history, thread_id)
+    if not receipts:
+        return
+    db = _reaction_db(timeout=0)
+    try:
+        rows = db.execute("SELECT chat,message,digest,created FROM desktop_submissions WHERE bot=? AND thread=? AND turn='' AND created>? ORDER BY created,message LIMIT 50",
+                          (token.split(':')[0], thread_id, time.time()-86400)).fetchall()
+    finally:
+        db.close()
+    for chat, message, digest, created in rows:
+        if deadline is not None and time.monotonic() >= deadline:
+            return
+        for receipt in receipts:
+            if (receipt['created'] < created or receipt['created'] > time.time()+1
+                    or receipt['digest'] != digest
+                    or (expected_turn_id and receipt['turn_id'] != expected_turn_id)):
+                continue
+            if bind_desktop_submission(token, chat, message, thread_id, receipt['turn_id'], receipt['item_id'], update_reaction=False):
+                break
+
+
+def payload_turn_id(payload):
+    explicit = str(payload.get('turn_id') or payload.get('turn-id') or payload.get('turnId') or '')
+    if explicit:
+        return explicit
+    from .completion_routing import identity
+    thread = identity(payload)[0]
+    final = payload.get('last_assistant_message') or payload.get('last-assistant-message')
+    return desktop_receipts.completion_turn(thread, final, SESSION_ROOT)
+
+
+def complete_task_reactions(token, thread_id, turn_id, *, outcome=None):
+    # A thread alone cannot distinguish an old completion from a newer reply.
+    if not thread_id or not turn_id:
+        return
+    bot = token.split(":")[0]
+    db = _reaction_db()
+    try:
+        with db:
+            previous = db.execute('SELECT emoji FROM reaction_outcomes WHERE bot=? AND thread=? AND turn=?', (bot, thread_id, turn_id)).fetchone()
+            outcome = outcome or (previous[0] if previous else '🎉')
+            if outcome not in {'🎉', '😢'}:
+                raise ValueError('Invalid task outcome')
+            db.execute('INSERT OR REPLACE INTO reaction_outcomes VALUES (?,?,?,?)', (bot, thread_id, turn_id, outcome))
+            db.execute("INSERT OR REPLACE INTO reaction_delivered VALUES (?,?,?,?)", (bot, thread_id, turn_id, time.time()))
+            db.execute("DELETE FROM reaction_delivered WHERE updated<?", (time.time()-7*86400,))
+            db.execute('DELETE FROM reaction_outcomes WHERE NOT EXISTS (SELECT 1 FROM reaction_delivered d WHERE d.bot=reaction_outcomes.bot AND d.thread=reaction_outcomes.thread AND d.turn=reaction_outcomes.turn)')
+    finally:
+        db.close()
+    for chat, message, thread, turn, emoji, updated in task_reactions(token):
+        if thread == thread_id and turn == turn_id:
+            set_task_reaction(token, chat, message, outcome, thread, turn)
+
+
+def reaction_delivery_confirmed(token, thread_id, turn_id):
+    db = _reaction_db()
+    try:
+        return bool(db.execute("SELECT 1 FROM reaction_delivered WHERE bot=? AND thread=? AND turn=?",
+                               (token.split(":")[0], thread_id, turn_id)).fetchone())
+    finally:
+        db.close()
+
+
+def complete_payload_reactions(payload):
+    loaded = load_config()
+    if loaded:
+        _, token = loaded
+        try:
+            from .completion_routing import identity
+            thread = identity(payload)[0]
+            resolve_desktop_submissions(token, thread)
+            complete_task_reactions(token, thread, payload_turn_id(payload))
+        except Exception as exc:
+            log_error(f"reaction completion failed: {exc}", token)
+
+
+
+class TelegramApiError(RuntimeError):
+    """A definite Telegram rejection, distinct from ambiguous transport failures."""
+    def __init__(self, code: int, description: str, parameters=None):
+        self.code = code
+        self.description = description
+        self.parameters = parameters or {}
+        self.retry_after = self.parameters.get('retry_after')
+        super().__init__(f"Telegram API {code}: {description}")
+
+
+def telegram_call(
+    token: str,
+    method: str,
+    payload: dict[str, Any] | None = None,
+    timeout: float = 20,
+) -> Any:
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "Codex-Telegram-Notify/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(exc)
+        finally:
+            exc.close()
+        try:
+            rejection = json.loads(detail)
+        except (ValueError, TypeError):
+            raise RuntimeError(f"Telegram HTTP {exc.code}") from exc
+        if not isinstance(rejection, dict) or rejection.get("ok") is not False:
+            raise RuntimeError(f"Telegram HTTP {exc.code}") from exc
+        raise TelegramApiError(exc.code, str(rejection.get("description", "")), rejection.get('parameters')) from exc
+    except URLError as exc:
+        raise RuntimeError(_t('无法连接 Telegram API: {p0}', p0=format(exc.reason, ''))) from exc
+
+    if not result.get("ok"):
+        raise TelegramApiError(int(result.get("error_code", 0)), str(result.get("description", "unknown error")), result.get('parameters'))
+    return result.get("result")
+
+
+def send_message(token: str, payload: dict[str, Any]) -> Any:
+    """Send a Telegram message with retries for slow proxy/TUN connections."""
+    last_error: Exception | None = None
+    for delay in (0, 2, 5):
+        if delay:
+            time.sleep(delay)
+        try:
+            return telegram_call(token, "sendMessage", payload, timeout=30)
+        except Exception as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
+def telegram_multipart_call(
+    token: str,
+    method: str,
+    fields: dict[str, Any],
+    *,
+    file_field: str = "",
+    filename: str = "",
+    content: bytes = b"",
+    files: list[dict[str, Any]] | None = None,
+    content_type: str = "application/octet-stream",
+    timeout: float = 45,
+) -> Any:
+    """Call a Telegram upload method using a small standard-library multipart body."""
+    boundary = f"CodexTelegram{secrets.token_hex(12)}"
+    body = bytearray()
+
+    def append(value: str | bytes) -> None:
+        body.extend(value.encode("utf-8") if isinstance(value, str) else value)
+
+    for name, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif isinstance(value, (dict, list)):
+            rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            rendered = str(value)
+        append(f"--{boundary}\r\n")
+        append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n')
+        append(rendered)
+        append("\r\n")
+
+    uploads = files if files is not None else [{"field": file_field, "filename": filename, "content": content, "content_type": content_type}]
+    for upload in uploads:
+        field = str(upload["field"])
+        if not re.fullmatch(r"[A-Za-z0-9_]+", field):
+            raise ValueError("Invalid multipart attachment name")
+        safe_filename = re.sub(r"[^A-Za-z0-9._-]+", "-", upload["filename"]).strip(".-") or "screenshot.png"
+        append(f"--{boundary}\r\n")
+        append(f'Content-Disposition: form-data; name="{field}"; filename="{safe_filename}"\r\n')
+        append(f"Content-Type: {upload.get('content_type', 'application/octet-stream')}\r\n\r\n")
+        append(upload["content"])
+        append("\r\n")
+    append(f"--{boundary}--\r\n")
+
+    request = Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=bytes(body),
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "Codex-Telegram-Notify/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            try:
+                result = json.loads(response.read().decode("utf-8"))
+            except (ValueError, UnicodeError) as exc:
+                raise RuntimeError('Telegram upload response could not be verified') from exc
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(exc)
+        finally:
+            exc.close()
+        try:
+            rejection = json.loads(detail)
+        except (ValueError, TypeError):
+            raise RuntimeError(f"Telegram HTTP {exc.code}") from exc
+        if not isinstance(rejection, dict) or rejection.get("ok") is not False:
+            raise RuntimeError(f"Telegram HTTP {exc.code}") from exc
+        raise TelegramApiError(exc.code, str(rejection.get("description", "")), rejection.get('parameters')) from exc
+    except URLError as exc:
+        raise RuntimeError(_t('无法连接 Telegram API: {p0}', p0=format(exc.reason, ''))) from exc
+    if not isinstance(result, dict) or type(result.get('ok')) is not bool:
+        raise RuntimeError('Telegram upload response could not be verified')
+    if result.get('ok') is False:
+        try:
+            code = int(result.get('error_code', 0))
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise RuntimeError('Telegram upload response could not be verified') from exc
+        raise TelegramApiError(code, str(result.get("description", "unknown error")), result.get('parameters'))
+    return result.get("result")
+
+
+def send_screenshot_album(token, chat_id, pictures, silent=False, reply_to=None):
+    """Upload full-resolution photos; Bot API has no documented HD/SD switch."""
+    if not pictures:
+        raise ValueError(_t('没有可发送的截图。'))
+    for picture in pictures:
+        width, height = picture['width'], picture['height']
+        if min(width, height) <= 0 or width+height > 10000 or max(width, height)/min(width, height) > 20 or len(picture['content']) > 10*1024*1024:
+            raise ValueError(_t('截图超出 Telegram 照片限制，未改为文件发送。'))
+    for offset in range(0, len(pictures), 10):
+        batch = pictures[offset:offset+10]
+        kind = "photo"
+        fields = {"chat_id": chat_id, "disable_notification": silent}
+        if reply_to:
+            fields["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+        if len(batch) == 1:
+            picture = batch[0]
+            fields['caption'] = picture['caption']
+            telegram_multipart_call(token, "sendPhoto", fields,
+                file_field=kind, filename=f"screenshot-{offset+1}.png", content=picture['content'], content_type="image/png")
+        else:
+            fields['media'] = [{"type": kind, "media": f"attach://shot{i}", "caption": x['caption']}
+                               for i, x in enumerate(batch)]
+            uploads = [{"field": f"shot{i}", "filename": f"screenshot-{offset+i+1}.png", "content": x['content'], "content_type": "image/png"}
+                       for i, x in enumerate(batch)]
+            telegram_multipart_call(token, "sendMediaGroup", fields, files=uploads)
+
+
+def send_document(
+    token: str,
+    *,
+    chat_id: str,
+    filename: str,
+    content: bytes,
+    caption: str = "",
+    silent: bool = False,
+) -> Any:
+    from .delivery import TelegramDeliveryUnknown, delivery_error, verified_message, validate_document
+    validate_document(content)
+    fields: dict[str, Any] = {
+        "chat_id": chat_id,
+        "caption": caption,
+        "disable_notification": silent,
+    }
+    # The Windows default path shares the transport rules without adopting
+    # the app-server queue. Bound both attempts and cumulative rate-limit wait.
+    remaining_wait = 30.0
+    for attempt in range(3):
+        try:
+            return verified_message(telegram_multipart_call(
+                token,
+                "sendDocument",
+                fields,
+                file_field="document",
+                filename=filename,
+                content=content,
+                content_type="text/markdown; charset=utf-8",
+            ))
+        except Exception as exc:
+            status, delay = delivery_error(exc)
+            if status == 'unknown':
+                raise TelegramDeliveryUnknown(_t('Telegram 未确认文件是否送达；请先检查聊天，不会自动重发。')) from exc
+            if status != 'retry' or attempt == 2:
+                raise
+            if delay > remaining_wait:
+                raise TelegramApiError(429, _t('Telegram 暂时限制文件发送，请稍后再试。'), {'retry_after': delay}) from exc
+            time.sleep(delay)
+            remaining_wait -= delay
+
+
+_INLINE_MARKDOWN = re.compile(
+    r"`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|"
+    r"\[[^\]\n]+\]\(https?://[^\s<>\)]+\)",
+    re.IGNORECASE,
+)
+
+
+def _telegram_html_inline(text: str) -> str:
+    """Render a safe, deliberately small Markdown subset as Telegram HTML."""
+    output: list[str] = []
+    position = 0
+    for match in _INLINE_MARKDOWN.finditer(text):
+        output.append(html.escape(text[position : match.start()]))
+        token = match.group(0)
+        if token.startswith("`"):
+            output.append(f"<code>{html.escape(token[1:-1])}</code>")
+        elif token.startswith("**") or token.startswith("__"):
+            output.append(f"<b>{html.escape(token[2:-2])}</b>")
+        elif token.startswith("~~"):
+            output.append(f"<s>{html.escape(token[2:-2])}</s>")
+        else:
+            split_at = token.rfind("](")
+            label = token[1:split_at]
+            url = token[split_at + 2 : -1]
+            output.append(
+                f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
+            )
+        position = match.end()
+    output.append(html.escape(text[position:]))
+    return "".join(output)
+
+
+def _table_cells(line: str) -> list[str] | None:
+    """Split structural pipes, preserving escaped pipes and inline code pipes."""
+    value = line.strip()
+    cells: list[str] = []
+    cell: list[str] = []
+    fence = 0
+    pipes = 0
+    index = 0
+    leading = value.startswith("|")
+    trailing = False
+    while index < len(value):
+        char = value[index]
+        if char == "\\" and index + 1 < len(value):
+            following = value[index + 1]
+            cell.append(following if following == "|" else char + following)
+            index += 2
+            trailing = False
+            continue
+        if char == "`":
+            end = index + 1
+            while end < len(value) and value[end] == "`":
+                end += 1
+            width = end - index
+            if fence == width:
+                fence = 0
+            elif not fence and value.find("`" * width, end) >= 0:
+                fence = width
+            cell.append(value[index:end])
+            index = end
+            trailing = False
+            continue
+        if char == "|" and not fence:
+            cells.append("".join(cell).strip())
+            cell = []
+            pipes += 1
+            trailing = True
+        else:
+            cell.append(char)
+            trailing = False
+        index += 1
+    if not pipes:
+        return None
+    cells.append("".join(cell).strip())
+    if leading:
+        cells = cells[1:]
+    if trailing:
+        cells = cells[:-1]
+    return cells
+
+
+def format_markdown_tables(text: str) -> str:
+    """Present GFM tables as readable field/value cards on narrow Telegram screens.
+
+    This is a display transform only; reply caches and Markdown downloads stay raw.
+    """
+    lines = str(text or "").splitlines()
+    output: list[str] = []
+    index = 0
+    code_fence = ""
+    while index < len(lines):
+        line = lines[index]
+        fence_match = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not code_fence:
+                code_fence = marker
+            elif marker[0] == code_fence[0] and len(marker) >= len(code_fence):
+                code_fence = ""
+            output.append(line)
+            index += 1
+            continue
+        header = _table_cells(line) if not code_fence and not line.startswith(("    ", "\t")) else None
+        divider = _table_cells(lines[index + 1]) if index + 1 < len(lines) else None
+        if (not header or len(header) < 2 or not divider or len(divider) != len(header)
+                or not all(re.fullmatch(r":?-{3,}:?", cell) for cell in divider)):
+            output.append(line)
+            index += 1
+            continue
+        row_index = index + 2
+        rows: list[list[str]] = []
+        while row_index < len(lines):
+            row = _table_cells(lines[row_index])
+            if row is None or len(row) != len(header):
+                break
+            rows.append(row)
+            row_index += 1
+        if not rows:
+            output.append(line)
+            index += 1
+            continue
+        for row in rows:
+            if output and output[-1] != "":
+                output.append("")
+            for column, (label, value) in enumerate(zip(header, row), 1):
+                label = label.strip().removeprefix("**").removesuffix("**") or _t('第 {p0} 列', p0=format(column, ''))
+                value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE) or "—"
+                output.append(f"**{label}：** {value}")
+            output.append("")
+        index = row_index
+    return "\n".join(output)
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    """Convert common Codex Markdown without exposing Telegram's strict parser."""
+    rendered: list[str] = []
+    code_lines: list[str] = []
+    in_code_block = False
+
+    for line in format_markdown_tables(text).splitlines():
+        if re.match(r"^\s*```", line):
+            if in_code_block:
+                rendered.append(f"<pre>{html.escape(chr(10).join(code_lines))}</pre>")
+                code_lines = []
+                in_code_block = False
+            else:
+                in_code_block = True
+            continue
+        if in_code_block:
+            code_lines.append(line)
+            continue
+
+        heading = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if heading:
+            rendered.append(f"<b>{_telegram_html_inline(heading.group(1))}</b>")
+            continue
+        quote = re.match(r"^\s*>\s?(.*)$", line)
+        if quote:
+            rendered.append(f"<blockquote>{_telegram_html_inline(quote.group(1))}</blockquote>")
+            continue
+        bullet = re.match(r"^\s*[-+*]\s+(.+)$", line)
+        if bullet:
+            rendered.append(f"• {_telegram_html_inline(bullet.group(1))}")
+            continue
+        ordered = re.match(r"^\s*(\d+)[.)]\s+(.+)$", line)
+        if ordered:
+            rendered.append(
+                f"{ordered.group(1)}. {_telegram_html_inline(ordered.group(2))}"
+            )
+            continue
+        if re.match(r"^\s*([-*_])\1{2,}\s*$", line):
+            rendered.append("────────")
+            continue
+        rendered.append(_telegram_html_inline(line))
+
+    if in_code_block:
+        rendered.append(f"<pre>{html.escape(chr(10).join(code_lines))}</pre>")
+    return "\n".join(rendered)
+
+
+def _telegram_units(text: str) -> int:
+    return len(text.encode('utf-16-le')) // 2
+
+
+def _split_long_line(line: str, limit: int) -> list[str]:
+    if _telegram_units(line) <= limit:
+        return [line]
+    parts = []
+    remaining = line
+    while _telegram_units(remaining) > limit:
+        units = 0
+        boundary = 0
+        for char in remaining:
+            width = 2 if ord(char) > 0xffff else 1
+            if units + width > limit:
+                break
+            units += width
+            boundary += 1
+        cut = max(remaining.rfind(mark, 0, boundary + 1) for mark in (' ', '，', '。', ','))
+        if cut < boundary // 2:
+            cut = boundary
+        elif remaining[cut] == ' ' and cut < boundary:
+            cut += 1
+        parts.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
+def _split_markdown_text_pages(text: str, limit: int = REPLY_PAGE_LIMIT) -> list[str]:
+    """Split Markdown while closing and reopening fenced code blocks at page edges."""
+    value = str(text or "").strip()
+    if not value:
+        return []
+    if limit < 256:
+        raise ValueError("reply page limit is too small")
+    if _telegram_units(value) <= limit:
+        return [value]
+
+    expanded_lines: list[str] = []
+    for line in value.splitlines():
+        if line.lstrip().startswith("```"):
+            expanded_lines.append(line)
+        else:
+            expanded_lines.extend(_split_long_line(line, limit - 64))
+
+    pages: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    in_fence = False
+    fence_opener = "```"
+
+    def flush() -> None:
+        nonlocal current, current_length
+        if not current:
+            return
+        page_lines = list(current)
+        if in_fence:
+            page_lines.append("```")
+        page = "\n".join(page_lines).strip()
+        if page:
+            pages.append(page)
+        current = [fence_opener] if in_fence else []
+        current_length = _telegram_units(fence_opener) if in_fence else 0
+
+    for line in expanded_lines:
+        stripped = line.lstrip()
+        is_fence = stripped.startswith("```")
+        next_in_fence = not in_fence if is_fence else in_fence
+        separator = 1 if current else 0
+        projected = current_length + separator + _telegram_units(line)
+        closing_reserve = 4 if next_in_fence else 0
+        if current and projected + closing_reserve > limit:
+            flush()
+            separator = 1 if current else 0
+        current.append(line)
+        current_length += separator + _telegram_units(line)
+        if is_fence:
+            if in_fence:
+                in_fence = False
+                fence_opener = "```"
+            else:
+                in_fence = True
+                fence_opener = stripped or "```"
+
+    flush()
+    return pages
+
+
+def split_markdown_pages(text: str, limit: int = REPLY_PAGE_LIMIT) -> list[str]:
+    """Keep native tables intact and repeat their headers on continuation pages."""
+    if limit < 256:
+        raise ValueError("reply page limit is too small")
+    lines = str(text or "").strip().splitlines()
+    chunks: list[str] = []
+    prose: list[str] = []
+    fence = ""
+    i = 0
+    def flush_prose() -> None:
+        if prose:
+            chunks.extend(_split_markdown_text_pages("\n".join(prose), limit))
+            prose.clear()
+    while i < len(lines):
+        line = lines[i]
+        match = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if match:
+            marker = match.group(1)
+            if not fence:
+                fence = marker
+            elif marker[0] == fence[0] and len(marker) >= len(fence):
+                fence = ""
+        header = _table_cells(line) if not fence and not match and not line.startswith(("    ", "\t")) else None
+        divider = _table_cells(lines[i + 1]) if i + 1 < len(lines) else None
+        if not (header and len(header) >= 2 and divider and len(header) == len(divider)
+                and all(re.fullmatch(r":?-{3,}:?", cell) for cell in divider)):
+            prose.append(line)
+            i += 1
+            continue
+        end = i + 2
+        while end < len(lines):
+            row = _table_cells(lines[end])
+            if row is None or len(row) != len(header):
+                break
+            end += 1
+        if end == i + 2:
+            prose.append(line)
+            i += 1
+            continue
+        flush_prose()
+        heading = "\n".join(lines[i:i + 2])
+        part = heading
+        for row in lines[i + 2:end]:
+            if _telegram_units(heading) + 1 + _telegram_units(row) > limit:
+                if part != heading:
+                    chunks.append(part)
+                    part = heading
+                # An individual enormous row cannot fit; preserve every field.
+                chunks.extend(_split_markdown_text_pages(format_markdown_tables(heading + "\n" + row), limit))
+            else:
+                if _telegram_units(part) + 1 + _telegram_units(row) > limit:
+                    chunks.append(part)
+                    part = heading
+                part += "\n" + row
+        if part != heading:
+            chunks.append(part)
+        i = end
+    flush_prose()
+    pages: list[str] = []
+    for chunk in chunks:
+        if pages and _telegram_units(pages[-1]) + 2 + _telegram_units(chunk) <= limit:
+            pages[-1] += "\n\n" + chunk
+        else:
+            pages.append(chunk)
+    return pages
+
+
+def _preview_exceeds_limit(text: str, limit: int) -> bool:
+    """Use Telegram's UTF-16 budget for both preview and cache decisions."""
+    return _telegram_units(str(text or "").strip()) > limit
+
+
+def markdown_preview(text: str, limit: int) -> str:
+    value = str(text or "").strip()
+    if not _preview_exceeds_limit(value, limit):
+        return value
+    pages = split_markdown_pages(value, limit - 32)
+    return (pages[0] if pages else "") + _t('\n\n…（查看完整回复）')
+
+
+def cleanup_reply_cache(now: float | None = None) -> None:
+    if not REPLY_CACHE_DIR.exists():
+        return
+    cutoff = (time.time() if now is None else now) - REPLY_RETENTION_SECONDS
+    for path in REPLY_CACHE_DIR.glob("*.json"):
+        if not re.fullmatch(r"[0-9a-f]{16}\.json", path.name):
+            continue
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError as exc:
+            log_error(f"could not clean reply cache {path.name}: {exc}")
+
+
+def cache_full_reply(payload: dict[str, Any], thread_id: str = "", *, force: bool = False) -> str | None:
+    value = payload.get("last_assistant_message")
+    if not isinstance(value, str):
+        return None
+    # Display previews may trim surrounding whitespace; downloads retain the
+    # original answer byte-for-byte, including code indentation/newlines.
+    text = value
+    if not force and not any(_preview_exceeds_limit(value, REPLY_PREVIEW_LIMIT)
+                             for value in (text, format_markdown_tables(text))):
+        return None
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_CACHED_REPLY_BYTES:
+        log_error(f"reply too large to cache: {len(encoded)} bytes")
+        return None
+    try:
+        REPLY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cleanup_reply_cache()
+        cache_id = secrets.token_hex(8)
+        cwd = str(payload.get("cwd") or "")
+        record = {
+            "version": 1,
+            "id": cache_id,
+            "created_at": int(time.time()),
+            "thread_id": thread_id,
+            "workspace": workspace_name(cwd),
+            "text": text,
+        }
+        target = REPLY_CACHE_DIR / f"{cache_id}.json"
+        temporary = REPLY_CACHE_DIR / f"{cache_id}.json.tmp.{os.getpid()}"
+        temporary.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, target)
+        return cache_id
+    except OSError as exc:
+        log_error(f"could not cache full reply: {exc}")
+        return None
+
+
+def load_cached_reply(cache_id: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{16}", cache_id):
+        raise ValueError(_t('完整回复链接无效。'))
+    cleanup_reply_cache()
+    path = REPLY_CACHE_DIR / f"{cache_id}.json"
+    if not path.is_file():
+        raise FileNotFoundError(_t('完整回复已过期或不存在。'))
+    if path.stat().st_size > MAX_CACHED_REPLY_BYTES + 64 * 1024:
+        raise ValueError(_t('完整回复缓存文件异常。'))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(record, dict) or not isinstance(record.get("text"), str):
+        raise ValueError(_t('完整回复缓存内容无效。'))
+    return record
+
+
+def build_notification_keyboard(thread_id: str = "", cache_id: str | None = None) -> dict[str, Any] | None:
+    rows: list[list[dict[str, str]]] = []
+    if thread_id and len(thread_id) <= 52:
+        rows.append([
+            {"text": _t('查看任务详情'), "callback_data": f"task|{thread_id}"},
+            {"text": _t('💬 直接回复'), "callback_data": f"direct|{thread_id}"},
+        ])
+        try:
+            from ..features.artifacts import list_artifacts
+            artifacts = list_artifacts(thread_id, SOURCE_STATE_ROOT)
+            if artifacts:
+                rows.append([
+                    {"text": _t('📂 Artifacts ({p0})', p0=format(len(artifacts), '')), "callback_data": f"artifacts|{thread_id}"}
+                ])
+        except Exception:
+            pass
+    if cache_id:
+        rows.append([
+            {"text": _t('📖 查看完整回复'), "callback_data": f"reply|{cache_id}|0"},
+            {"text": _t('⬇️ 下载 Markdown'), "callback_data": f"replyfile|{cache_id}"},
+        ])
+    return {"inline_keyboard": rows} if rows else None
+
+
+def _format_rejected(exc: Exception, *, rich: bool = False) -> bool:
+    if not isinstance(exc, TelegramApiError):
+        return False
+    description = exc.description.lower()
+    if rich and exc.code == 404 and description in {"not found", "method not found"}:
+        return True
+    if exc.code != 400:
+        return False
+    # Rich media validation is a definite content rejection. In particular,
+    # Codex replies can embed local image paths that Telegram cannot fetch.
+    # Keep the reply deliverable as text without retrying uncertain sends.
+    if rich and re.search(r"\brich_message_(?:[a-z0-9]+_)*invalid\b", description):
+        return True
+    markers = ["parse entities", "unsupported start tag", "can't find end"]
+    if rich:
+        markers += ["can't parse rich", "cannot parse rich", "can't parse markdown",
+                    "rich messages are not supported", "rich_message is not supported",
+                    "method not found", "unknown method"]
+    return any(marker in description for marker in markers)
+
+
+def visible_reply_markup(markup: Any) -> Any:
+    # Keep direct actions in the internal payload for task association and old
+    # callback compatibility, but no longer display the redundant UI button.
+    if isinstance(markup, dict) and "inline_keyboard" in markup:
+        rows = [[button for button in row
+                 if not str(button.get("callback_data", "")).startswith("direct|")]
+                for row in markup["inline_keyboard"]]
+        return dict(markup, inline_keyboard=[row for row in rows if row])
+    return markup
+
+
+def prepare_local_image_reply(token: str, payload: dict[str, Any], *, upload: bool) -> dict[str, Any]:
+    """Upload explicit local images once; the complete text remains a separate send."""
+    original = str(payload.get("text") or "")
+    base_dir = str(payload.get("_local_image_base") or "")
+    images = local_images.find_local_images(original, base_dir)
+    # A notification preview can end before the images in the final reply.
+    # Read media references from the original reply, while rendering its preview.
+    references = local_images.find_local_images(str(payload.get("_local_image_text") or original), base_dir) if upload else images
+    if not images and not references:
+        return payload
+    outcomes: dict[str, str] = {}
+    display_paths: dict[str, str] = {}
+    attempts = 0
+    used_bytes = 0
+    for image in references + images:
+        key = os.path.normcase(image.path)
+        if key in outcomes:
+            continue
+        display_paths[key] = image.path
+        outcome = "path"
+        upload_started = False
+        if upload and attempts < local_images.MAX_REPLY_PHOTOS:
+            try:
+                content, content_type = local_images.read_photo(
+                    image.path, local_images.MAX_REPLY_PHOTO_BYTES - used_bytes)
+                attempts += 1
+                used_bytes += len(content)
+                # Match the original destination, source quote and notification
+                # preferences. Photos and final text share the same task route.
+                fields = {key: payload[key] for key in (
+                    "chat_id", "message_thread_id", "direct_messages_topic_id", "business_connection_id",
+                    "disable_notification", "protect_content", "reply_parameters") if key in payload}
+                fields["caption"] = ("📷 " + (image.label or Path(image.path).name))[:900]
+                if payload.get("reply_markup"):
+                    fields["reply_markup"] = visible_reply_markup(payload["reply_markup"])
+                upload_started = True
+                sent = telegram_multipart_call(token, "sendPhoto", fields, file_field="photo",
+                    filename=Path(image.path).name, content=content, content_type=content_type, timeout=30)
+                if not isinstance(sent, dict) or not isinstance(sent.get("message_id"), int):
+                    raise RuntimeError(_t('图片发送结果未确认'))
+                remember_task_message(token, payload, sent)
+                outcome = "sent"
+                log_error(f"local image delivered; message_id={sent['message_id']}", token)
+            except (OSError, ValueError) as exc:
+                if upload_started:
+                    outcome = "uncertain"
+                    log_error(f"local image delivery unconfirmed; using path button without retry: {type(exc).__name__}", token)
+                else:
+                    log_error(f"local image unavailable; using path button: {type(exc).__name__}", token)
+            except TelegramApiError as exc:
+                outcome = "failed"
+                log_error(f"local image rejected; using path button: {exc}", token)
+            except Exception as exc:
+                outcome = "uncertain"
+                log_error(f"local image delivery unconfirmed; using path button without retry: {type(exc).__name__}", token)
+        outcomes[key] = outcome
+
+    def escaped(value: str) -> str:
+        return re.sub(r"([\\`*_{}\[\]()<>#+.!|~-])", r"\\\1", value)
+
+    pieces: list[str] = []
+    offset = 0
+    for image in images:
+        pieces.append(original[offset:image.start])
+        label = escaped(image.label or Path(image.path).name)
+        outcome = outcomes[os.path.normcase(image.path)]
+        if outcome == "sent":
+            pieces.append(_t('**📷 图片已发送：** {p0}', p0=format(label, '')))
+        else:
+            status = {"path": "", "failed": _t('（上传失败）'), "uncertain": _t('（发送未确认）')}[outcome]
+            width = max((len(run) for run in re.findall(r"`+", image.path)), default=0) + 1
+            delimiter = "`" * max(3, width)
+            pieces.append(_t('**📂 图片路径{p0}：** {p1}\n\n{p2}text\n{p3}\n{p4}', p0=format(status, ''), p1=format(label, ''), p2=format(delimiter, ''), p3=format(image.path, ''), p4=format(delimiter, '')))
+        offset = image.end
+    pieces.append(original[offset:])
+    prepared = dict(payload, text="".join(pieces))
+    markup = payload.get("reply_markup")
+    if markup is None or (isinstance(markup, dict) and "inline_keyboard" in markup):
+        rows = [list(row) for row in (markup or {}).get("inline_keyboard", [])]
+        for index, (key, outcome) in enumerate(outcomes.items(), 1):
+            if outcome == "sent":
+                continue
+            path = display_paths[key]
+            try:
+                button = local_images.path_button(token, str(payload.get("chat_id") or ""), path)
+                if len(outcomes) > 1:
+                    button = dict(button, text=button["text"] + f" · {index}")
+                rows.append([button])
+            except (OSError, ValueError) as exc:
+                log_error(f"could not retain local image button: {type(exc).__name__}", token)
+        if rows:
+            prepared["reply_markup"] = dict(markup or {}, inline_keyboard=rows)
+    return prepared
+
+
+def _markdown_request(token: str, payload: dict[str, Any], *, edit: bool, api=None) -> Any:
+    call = api or (lambda method, request: telegram_call(token, method, request, timeout=30))
+    original = str(payload.get("text") or "")
+    base = dict(payload)
+    if "reply_markup" in base:
+        base["reply_markup"] = visible_reply_markup(base["reply_markup"])
+    for key in ("text", "parse_mode", "entities", "link_preview_options", "disable_web_page_preview", "_local_image_base", "_local_image_text"):
+        base.pop(key, None)
+    method = "editMessageText" if edit else "sendRichMessage"
+    rich_payload = dict(base, rich_message={"markdown": original})
+    try:
+        return call(method, rich_payload)
+    except Exception as exc:
+        if not _format_rejected(exc, rich=True):
+            raise
+        log_error(f"{method} format rejected; using text fallback: {exc}", token)
+    # Telegram explicitly rejected this request. Never downgrade on a timeout,
+    # proxy failure, authentication error, or rate limit: delivery may be uncertain.
+    fallback = format_markdown_tables(original)
+    if len(fallback) > MAX_TELEGRAM_MESSAGE:
+        fallback = fallback[:MAX_TELEGRAM_MESSAGE - 1].rstrip() + "…"
+    method = "editMessageText" if edit else "sendMessage"
+    legacy = dict(base, text=markdown_to_telegram_html(fallback), parse_mode="HTML")
+    try:
+        return call(method, legacy)
+    except Exception as exc:
+        if not _format_rejected(exc):
+            raise
+    return call(method, dict(base, text=fallback))
+
+
+NATIVE_REPLY_DIR = HOOK_DIR / "telegram_message_routes"
+ATTACHMENT_DIR = HOOK_DIR / "telegram_attachments"
+ATTACHMENT_LIMIT = 20 * 1024 * 1024
+
+
+def download_telegram_attachment(token: str, attachment: dict[str, Any]) -> Path:
+    """Download only Telegram file metadata, with bounded size and safe local names."""
+    from urllib.parse import quote
+    file_id = attachment.get("file_id")
+    if not isinstance(file_id, str) or not file_id:
+        raise ValueError(_t('附件缺少有效文件 ID。'))
+    if int(attachment.get("file_size") or 0) > ATTACHMENT_LIMIT:
+        raise ValueError(_t('附件超过 20 MB，请拆分后发送。'))
+    metadata = telegram_call(token, "getFile", {"file_id": file_id}, timeout=30)
+    remote = str(metadata.get("file_path") or "")
+    if not remote or remote.startswith('/') or '..' in remote.split('/') or '\\' in remote:
+        raise ValueError(_t('Telegram 返回的附件路径无效。'))
+    if int(metadata.get("file_size") or 0) > ATTACHMENT_LIMIT:
+        raise ValueError(_t('附件超过 20 MB，请拆分后发送。'))
+    filename = str(attachment.get("file_name") or "attachment.bin").replace('\\', '/').split('/')[-1]
+    filename = re.sub(r'[^\w.\- ]', '_', filename)[:120].strip(' .') or 'attachment.bin'
+    folder = ATTACHMENT_DIR / secrets.token_hex(16)
+    folder.mkdir(parents=True, exist_ok=False)
+    path = folder / ("file-" + filename)
+    try:
+        with urlopen(f"https://api.telegram.org/file/bot{token}/{quote(remote, safe='/')}", timeout=45) as response:
+            with path.open('xb') as output:
+                total = 0
+                while True:
+                    chunk = response.read(min(65536, ATTACHMENT_LIMIT - total + 1))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > ATTACHMENT_LIMIT:
+                        raise ValueError(_t('附件超过 20 MB，请拆分后发送。'))
+                    output.write(chunk)
+        return path.resolve()
+    except Exception:
+        path.unlink(missing_ok=True)
+        folder.rmdir()
+        # urllib exceptions can contain the credential-bearing URL.
+        raise ValueError(_t('附件下载失败或超过 20 MB；未转交任务，请稍后重试。')) from None
+
+
+def task_from_keyboard(markup: dict[str, Any] | None) -> str | None:
+    """Only task cards with an explicit direct-reply action are routable."""
+    targets = set()
+    has_direct = False
+    for row in (markup or {}).get("inline_keyboard", []):
+        for button in row:
+            action, _, value = str(button.get("callback_data", "")).partition("|")
+            if action in {"direct", "task", "watch", "stop", "diff", "usage", "unwatch", "artifacts"} and value:
+                targets.add(value)
+                has_direct |= action == "direct"
+            elif action in {"artifactview", "artifactdl"} and value:
+                tid = value.partition(":")[0]
+                if tid:
+                    targets.add(tid)
+            elif action in {"reply", "replypage", "replyfile"}:
+                try:
+                    record = load_cached_reply(value.split("|")[0])
+                    if record.get("thread_id"):
+                        targets.add(record["thread_id"])
+                        has_direct = True
+                except (OSError, ValueError):
+                    pass
+    return next(iter(targets)) if has_direct and len(targets) == 1 else None
+
+
+def _route_path(token: str, chat_id: str, message_id: int) -> Path:
+    import hashlib
+    # Namespace by bot identity, chat and message; never persist the credential.
+    key = f"{token.split(':')[0]}:{chat_id}:{message_id}"
+    return NATIVE_REPLY_DIR / (hashlib.sha256(key.encode()).hexdigest() + ".json")
+
+
+def remember_task_message(token: str, payload: dict[str, Any], result: Any) -> None:
+    if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
+        return
+    thread_id = task_from_keyboard(payload.get("reply_markup"))
+    try:
+        chat_id = str((result.get("chat") or {}).get("id") or payload.get("chat_id") or "")
+        path = _route_path(token, chat_id, result["message_id"])
+        if not thread_id:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
+        temporary.write_text(json.dumps({"thread_id": thread_id}), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError as exc:
+        log_error(f"could not store native reply route: {exc}", token)
+
+
+def lookup_task_message(token: str, chat_id: str, message_id: int) -> str | None:
+    try:
+        record = json.loads(_route_path(token, chat_id, message_id).read_text(encoding="utf-8"))
+        value = record.get("thread_id")
+        return value if isinstance(value, str) and value else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def send_markdown_message(token: str, payload: dict[str, Any]) -> Any:
+    """Prefer native rich Markdown, including tables and the original keyboard."""
+    prepared = prepare_local_image_reply(token, payload, upload=True)
+    result = _markdown_request(token, prepared, edit=False)
+    remember_task_message(token, payload, result)
+    return result
+
+
+def send_html_message(token: str, payload: dict[str, Any], *, edit: bool = False) -> Any:
+    """Send already escaped UI HTML without Markdown conversion or truncation."""
+    request = dict(payload, parse_mode="HTML", link_preview_options={"is_disabled": True})
+    try:
+        result = telegram_call(token, "editMessageText" if edit else "sendMessage", request)
+    except TelegramApiError as exc:
+        if edit and exc.code == 400 and "message is not modified" in exc.description.lower():
+            return None
+        raise
+    remember_task_message(token, payload, result)
+    return result
+
+
+def edit_markdown_message(token: str, payload: dict[str, Any]) -> Any:
+    try:
+        # Paging and refreshing cards must not re-upload the same photos.
+        prepared = prepare_local_image_reply(token, payload, upload=False)
+        result = _markdown_request(token, prepared, edit=True)
+        remember_task_message(token, payload, result)
+        return result
+    except TelegramApiError as exc:
+        if exc.code == 400 and "message is not modified" in exc.description.lower():
+            return None
+        raise
+
+
+def log_error(message: str, token: str | None = None) -> None:
+    if token:
+        message = message.replace(token, "<redacted-token>")
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 256 * 1024:
+            LOG_PATH.replace(LOG_PATH.with_suffix(".log.old"))
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} {message}\n")
+    except Exception:
+        pass
+
+
+def _chat_candidates(updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    for update in updates:
+        message = (
+            update.get("message")
+            or update.get("edited_message")
+            or update.get("channel_post")
+        )
+        if not isinstance(message, dict) or not isinstance(message.get("chat"), dict):
+            continue
+        chat = message["chat"]
+        chat_id = str(chat.get("id", ""))
+        if not chat_id:
+            continue
+        candidates[chat_id] = {
+            "id": chat_id,
+            "type": chat.get("type", "unknown"),
+            "name": chat.get("title")
+            or " ".join(
+                part
+                for part in [chat.get("first_name", ""), chat.get("last_name", "")]
+                if part
+            )
+            or chat.get("username")
+            or chat_id,
+            "date": int(message.get("date", 0)),
+        }
+    return sorted(candidates.values(), key=lambda item: item["date"], reverse=True)
+
+
+def choose_chat_id(token: str) -> str:
+    while True:
+        manual = input(_t('Chat ID（直接回车可从你发给机器人的消息中自动识别）: ')).strip()
+        if manual:
+            return manual
+
+        input(_t('请在 Telegram 打开机器人并发送 /start，然后回到这里按回车继续...'))
+        try:
+            updates = telegram_call(token, "getUpdates", {"limit": 100, "timeout": 0})
+        except Exception as exc:
+            print(_t('无法自动读取 Chat ID：{p0}', p0=format(exc, '')))
+            print(_t('如果机器人配置过 Webhook，请手动输入 Chat ID。\n'))
+            continue
+
+        candidates = _chat_candidates(updates or [])
+        if not candidates:
+            print(_t('尚未找到聊天记录。请确认你已经向机器人发送 /start。\n'))
+            continue
+        if len(candidates) == 1:
+            selected = candidates[0]
+            print(_t('已识别：{p0} ({p1}, {p2})', p0=format(selected['name'], ''), p1=format(selected['type'], ''), p2=format(selected['id'], '')))
+            return selected["id"]
+
+        print(_t('检测到多个聊天，请选择：'))
+        for index, item in enumerate(candidates, start=1):
+            print(f"  {index}. {item['name']} ({item['type']}, {item['id']})")
+        selection = input(_t('序号: ')).strip()
+        if selection.isdigit() and 1 <= int(selection) <= len(candidates):
+            return candidates[int(selection) - 1]["id"]
+        print(_t('选择无效，请重试。\n'))
+
+
+def _allowed_user_ids(value) -> list[int]:
+    """Normalize an explicitly supplied allowlist, never a chat membership list."""
+    if not isinstance(value, list) or not value:
+        raise ValueError(_t('群聊必须配置至少一个获准使用机器人的用户 ID。'))
+    users = []
+    for item in value:
+        if isinstance(item, bool) or not re.fullmatch(r'[1-9][0-9]*', str(item)):
+            raise ValueError(_t('用户 ID 必须是正整数，多个 ID 请用逗号或空格分隔。'))
+        identifier = int(item)
+        if identifier not in users:
+            users.append(identifier)
+    return users
+
+
+def _previous_bot_id(config) -> str | None:
+    identifier = config.get('bot_id')
+    if isinstance(identifier, int) and not isinstance(identifier, bool) and identifier > 0:
+        return str(identifier)
+    try:
+        # Older configurations predate bot_id. Reading the existing protected
+        # token preserves their allowlist without saving a plaintext secret.
+        identifier = load_token(config).partition(':')[0]
+        return identifier if re.fullmatch(r'[1-9][0-9]*', identifier) else None
+    except Exception:
+        return None
+
+
+def _setup_group_allowlist(bot_id: int, chat_id: str) -> list[int]:
+    previous = json.loads(CONFIG_PATH.read_text(encoding='utf-8')) if CONFIG_PATH.exists() else {}
+    if not isinstance(previous, dict):
+        raise ValueError(_t('Telegram 通知配置无效。'))
+    saved = None
+    if str(previous.get('chat_id')) == chat_id and _previous_bot_id(previous) == str(bot_id):
+        try:
+            saved = _allowed_user_ids(previous.get('allowed_user_ids'))
+        except ValueError:
+            pass
+    if saved:
+        print(_t('当前群聊授权用户：{p0}', p0=', '.join(map(str, saved))))
+        answer = input(_t('授权用户 ID（回车保留；输入新列表替换，逗号或空格分隔）: ')).strip()
+        if not answer:
+            return saved
+    else:
+        answer = input(_t('请输入获准使用机器人的用户 ID（必填，逗号或空格分隔）: ')).strip()
+    return _allowed_user_ids(re.split(r'[,，\s]+', answer) if answer else [])
+
+
+def setup() -> int:
+    print(_t('Antigravity → Telegram 通知配置\n'))
+    print(_t('1. 在 Telegram 找 @BotFather 创建机器人并取得 Bot Token。'))
+    print(_t('2. Token 只会在本机输入，并保存到当前系统的安全凭据存储。\n'))
+
+    HOOK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    token = getpass.getpass(_t('Bot Token（输入时不会显示）: ')).strip()
+    if not token:
+        print(_t('未输入 Token，配置已取消。'))
+        return 1
+
+    try:
+        bot = telegram_call(token, "getMe")
+        bot_id = bot.get('id') if isinstance(bot, dict) else None
+        if not isinstance(bot_id, int) or isinstance(bot_id, bool) or bot_id <= 0:
+            raise ValueError(_t('机器人验证未返回有效的机器人 ID。'))
+        username = bot.get("username", "unknown") if isinstance(bot, dict) else "unknown"
+        print(_t('机器人验证成功：@{p0}', p0=format(username, '')))
+        chat_id = choose_chat_id(token)
+        if not re.fullmatch(r'-?[1-9][0-9]*', chat_id):
+            raise ValueError(_t('Chat ID 必须是非零整数。'))
+        allowed_users = _setup_group_allowlist(bot_id, chat_id) if int(chat_id) < 0 else None
+        preview_answer = input(_t('通知中包含 Antigravity 最后回复的预览？[y/N]: ')).strip().lower()
+        include_preview = preview_answer in {"y", "yes", "是"}
+        subagent_answer = input(_t('接收 Antigravity 子代理任务的完成通知？[y/N]: ')).strip().lower()
+        include_subagents = subagent_answer in {"y", "yes", "是"}
+        silent_answer = input(_t('以静默消息发送（不响铃）？[y/N]: ')).strip().lower()
+        silent = silent_answer in {"y", "yes", "是"}
+
+        config = {
+            "version": 1,
+            **store_token(token, CONFIG_PATH),
+            "bot_id": bot_id,
+            "chat_id": chat_id,
+            "include_message_preview": include_preview,
+            "include_subagent_notifications": include_subagents,
+            "silent": silent,
+        }
+        if allowed_users is not None:
+            config['allowed_user_ids'] = allowed_users
+        temporary = CONFIG_PATH.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        os.replace(temporary, CONFIG_PATH)
+    except Exception as exc:
+        print(_t('配置失败：{p0}', p0=format(str(exc).replace(token, '<redacted-token>'), '')))
+        return 1
+
+    print(_t('\n加密凭据已保存，正在发送测试消息（网络较慢时会自动重试）...'))
+    try:
+        send_message(
+            token,
+            {
+                "chat_id": chat_id,
+                "text": _t('🥳 Antigravity → Telegram 通知测试成功'),
+                "disable_notification": silent,
+            },
+        )
+    except Exception as exc:
+        safe_error = str(exc).replace(token, "<redacted-token>")
+        print(_t('测试消息发送失败，但配置已经保存：{p0}', p0=format(safe_error, '')))
+        print(_t('稍后可重新运行向导，或使用 --test 再次测试。'))
+        return 2
+
+    print(_t('Telegram 中应已收到测试消息。'))
+    print(_t('请完全退出并重新打开 Antigravity；无需 CLI，也无需 /hooks。'))
+    return 0
+
+
+def load_config() -> tuple[dict[str, Any], str] | None:
+    if not CONFIG_PATH.exists():
+        return None
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    token = load_token(config)
+    return config, token
+
+
+def message_preview_enabled(config: dict[str, Any] | None = None) -> bool:
+    if config is None:
+        if not CONFIG_PATH.exists():
+            return False
+        loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            return False
+        config = loaded
+    return config.get("include_message_preview") is True
+
+
+def set_message_preview(enabled: bool) -> None:
+    """Persist the message preview preference without touching the DPAPI token."""
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(_t('Telegram 通知尚未配置。'))
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError(_t('Telegram 通知配置无效。'))
+    config["include_message_preview"] = bool(enabled)
+    temporary = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.tmp.{os.getpid()}")
+    temporary.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, CONFIG_PATH)
+
+
+def subagent_notifications_enabled(config: dict[str, Any] | None = None) -> bool:
+    """Return the opt-in flag; missing and malformed values stay safely disabled."""
+    if config is None:
+        if not CONFIG_PATH.exists():
+            return False
+        loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            return False
+        config = loaded
+    return config.get("include_subagent_notifications") is True
+
+
+def set_subagent_notifications(enabled: bool) -> None:
+    """Persist the subagent notification preference without touching the DPAPI token."""
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(_t('Telegram 通知尚未配置。'))
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError(_t('Telegram 通知配置无效。'))
+    config["include_subagent_notifications"] = bool(enabled)
+    temporary = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.tmp.{os.getpid()}")
+    temporary.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, CONFIG_PATH)
+
+
+def _session_subagent_context(thread_id: str) -> dict[str, Any] | None:
+    """Inspect the immutable session header used by the legacy Desktop notify path."""
+    if not re.fullmatch(r"[A-Za-z0-9-]{6,64}", thread_id) or not SESSION_ROOT.exists():
+        return None
+    try:
+        candidates = [
+            path
+            for path in SESSION_ROOT.glob(f"*/*/*/rollout-*-{thread_id}.jsonl")
+            if path.is_file()
+        ]
+        if not candidates:
+            return None
+        path = max(candidates, key=lambda candidate: candidate.stat().st_mtime_ns)
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            first_line = handle.readline(2 * 1024 * 1024)
+        metadata = json.loads(first_line)
+        payload = metadata.get("payload") if isinstance(metadata, dict) else None
+        source = payload.get("source") if isinstance(payload, dict) else None
+        if isinstance(source, dict) and isinstance(source.get("subagent"), dict):
+            return source["subagent"]
+        if isinstance(source, str) and source.lower().replace("_", "") == "subagent":
+            return {"source": source}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        log_error(f"could not inspect session source {thread_id[:8]}: {exc}")
+    return None
+
+
+def subagent_completion_context(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Identify both official SubagentStop events and legacy Desktop completions."""
+    if payload.get("hook_event_name") == "SubagentStop":
+        return {
+            "agent_id": payload.get("agent_id"),
+            "agent_type": payload.get("agent_type"),
+        }
+    if payload.get("hook_event_name") in {"PreToolUse", "PostToolUse", "PermissionRequest"}:
+        agent_id = payload.get("agent_id")
+        if isinstance(agent_id, str) and agent_id:
+            return {
+                "agent_id": agent_id,
+                "agent_type": payload.get("agent_type"),
+            }
+    source_kind = payload.get("sourceKind") or payload.get("source_kind")
+    if isinstance(source_kind, str) and source_kind.lower().replace("_", "") == "subagent":
+        return {"source": source_kind}
+    thread_id = str(payload.get("thread_id") or payload.get("thread-id") or "")
+    return _session_subagent_context(thread_id) if thread_id else None
+
+
+def notifications_muted() -> bool:
+    """Read the shared controller mute flag without requiring its process."""
+    try:
+        if not BOT_STATE_PATH.exists():
+            return False
+        state = json.loads(BOT_STATE_PATH.read_text(encoding="utf-8"))
+        return (bool(state.get("muted")) or state.get("quiet_mode") is True) if isinstance(state, dict) else False
+    except Exception as exc:
+        log_error(f"could not read Telegram bot state: {exc}")
+        return False
+
+
+def _assistant_message(payload: dict[str, Any]) -> str | None:
+    """Read the assistant text used by either legacy notify or lifecycle hooks."""
+    value = payload.get("last-assistant-message")
+    if not isinstance(value, str):
+        value = payload.get("last_assistant_message")
+    return value if isinstance(value, str) else None
+
+
+def is_internal_task_metadata_completion(payload: dict[str, Any]) -> bool:
+    """Legacy diagnostic API; use route_completion for delivery decisions."""
+    return completion_thread_source(payload) in INTERNAL_SUGGESTION_SOURCES
+
+
+INTERNAL_SUGGESTION_SOURCES = frozenset({
+    "composer_predictions", "ambient_suggestions", "ambient_suggestion_safety",
+})
+_THREAD_SOURCE_FIELDS = ("threadSource", "thread_source", "thread-source")
+_TURN_TRIGGER_FIELDS = ("turnTrigger", "turn_trigger", "turn-trigger")
+
+
+def _stored_thread_purpose(thread_id: str) -> tuple[str, str | None]:
+    """Distinguish a missing temporary thread from a stored or unreadable thread."""
+    if not re.fullmatch(r"[A-Za-z0-9-]{6,64}", thread_id):
+        return "unavailable", None
+    try:
+        root = SOURCE_STATE_ROOT.resolve()
+        databases = [path for path in root.glob("state_*.sqlite")
+                     if re.fullmatch(r"state_[0-9]+\.sqlite", path.name)]
+    except (OSError, RuntimeError):
+        return "unavailable", None
+    databases.sort(key=lambda path: int(path.stem.split("_")[1]), reverse=True)
+    readable = False
+    for path in databases:
+        try:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root):
+                continue
+            db = sqlite3.connect(resolved.as_uri() + "?mode=ro", uri=True, timeout=0.2)
+            try:
+                row = db.execute("SELECT thread_source FROM threads WHERE id=?", (thread_id,)).fetchone()
+            finally:
+                db.close()
+            readable = True
+            if row is not None:
+                # An existing newer record with unknown purpose must not inherit
+                # stale attribution from an older state schema.
+                return "stored", row[0] if isinstance(row[0], str) and row[0] else None
+        except (OSError, sqlite3.Error):
+            continue
+    return ("missing" if readable else "unavailable"), None
+
+
+def _stored_thread_source(thread_id: str) -> str | None:
+    return _stored_thread_purpose(thread_id)[1]
+
+
+_PREDICTION_REQUEST_HEADER = (
+    "This is an app-generated request for a suggested next user message. "
+    "The user did not write this message."
+)
+_PREDICTION_COMPOSER_HEADER = "Your suggestion will appear in the user's empty message composer."
+_PREDICTION_SCHEMA_MARKER = "\n\nReturn only JSON matching this schema: "
+
+
+def _composer_prediction_request(payload: dict[str, Any]) -> bool:
+    """Match the observed Desktop generation request, never its generated reply.
+
+    Only the latest input is relevant: older inherited inputs cannot label a
+    subsequent normal turn. This compatibility check is used only for a thread
+    proven absent from a readable profile database and lacking other attribution.
+    """
+    if payload.get("type") != "agent-turn-complete" or payload.get("client") != "Codex Desktop":
+        return False
+    inputs = payload.get("input-messages")
+    if not isinstance(inputs, list) or not inputs or not isinstance(inputs[-1], str):
+        return False
+    text = inputs[-1].strip().replace("\r\n", "\n")
+    if len(text) > 32768 or not text.startswith(_PREDICTION_REQUEST_HEADER + "\n\n"):
+        return False
+    paragraphs = text.split("\n\n", 2)
+    if len(paragraphs) < 3 or not paragraphs[1].startswith(_PREDICTION_COMPOSER_HEADER):
+        return False
+    if text.count(_PREDICTION_SCHEMA_MARKER) != 1:
+        return False
+    schema_text = text.partition(_PREDICTION_SCHEMA_MARKER)[2]
+    if not schema_text.endswith("."):
+        return False
+    try:
+        schema = json.loads(schema_text[:-1])
+    except (TypeError, ValueError):
+        return False
+    return schema == {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"suggestion": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+        "required": ["suggestion"], "additionalProperties": False,
+    }
+
+
+def completion_thread_source(payload: dict[str, Any]) -> str | None:
+    """Legacy diagnostic hint; MUST NOT authorize or suppress a notification.
+
+    Kept for compatibility with structural sample tooling. Production delivery
+    uses completion_routing.classify, including independent task/turn evidence.
+    """
+    evidence: set[str] = set()
+    containers = [payload]
+    if isinstance(payload.get("thread"), dict):
+        containers.append(payload["thread"])
+    for container in containers:
+        for name in _THREAD_SOURCE_FIELDS + _TURN_TRIGGER_FIELDS:
+            value = container.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value):
+                return None
+            evidence.add(value)
+    identifiers = {value for name in ("thread-id", "thread_id")
+                   if isinstance(value := payload.get(name), str) and value}
+    nested_id = payload.get("thread", {}).get("id") if isinstance(payload.get("thread"), dict) else None
+    if isinstance(nested_id, str) and nested_id:
+        identifiers.add(nested_id)
+    if len(identifiers) > 1:
+        return None
+    status = "unavailable"
+    if identifiers:
+        status, stored = _stored_thread_purpose(next(iter(identifiers)))
+        if stored:
+            evidence.add(stored)
+    if not evidence and status == "missing" and len(identifiers) == 1:
+        if _composer_prediction_request(payload):
+            return "composer_predictions"
+        from .internal_requests import generation_request_source
+        return generation_request_source(payload)
+    return next(iter(evidence)) if len(evidence) == 1 else None
+
+
+def is_empty_suggestions_reply(payload: dict[str, Any]) -> bool:
+    """Explicit literal suppression policy, independent of source attribution."""
+    value = _assistant_message(payload)
+    return isinstance(value, str) and value.strip() == '{"suggestions":[]}'
+
+
+def _has_suggestion_envelope(payload: dict[str, Any]) -> bool:
+    """A diagnostic hint only: a matching JSON shape never authorizes dropping it."""
+    value = _assistant_message(payload)
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    if set(parsed) == {"suggestion"}:
+        return parsed["suggestion"] is None or isinstance(parsed["suggestion"], str)
+    if set(parsed) == {'exclude'}:
+        return isinstance(parsed['exclude'], list) and all(
+            isinstance(item, dict) and set(item) == {'id', 'reason'}
+            and all(isinstance(value, str) for value in item.values()) for item in parsed['exclude'])
+    if set(parsed) != {"suggestions"}:
+        return False
+    suggestions = parsed["suggestions"]
+    if not isinstance(suggestions, list):
+        return False
+    fields = {"title", "description", "prompt", "appId", "pluginId"}
+    return all(isinstance(item, dict) and set(item) == fields
+               and all(isinstance(item[key], str) and item[key].strip()
+                       for key in ("title", "description", "prompt"))
+               and all(item[key] is None or isinstance(item[key], str)
+                       for key in ("appId", "pluginId"))
+               for item in suggestions)
+
+
+def is_internal_suggestions_completion(payload: dict[str, Any]) -> bool:
+    """Legacy sample-analysis API, not the production notification gate."""
+    source = completion_thread_source(payload)
+    if source in INTERNAL_SUGGESTION_SOURCES:
+        return True
+    if source is None and _has_suggestion_envelope(payload):
+        thread = str(payload.get("thread-id") or payload.get("thread_id") or "")
+        safe_id = thread[:8] if re.fullmatch(r"[A-Za-z0-9-]{6,64}", thread) else "unknown"
+        diagnostic = ''
+        try:
+            from .notification_diagnostics import record
+            status, stored = _stored_thread_purpose(thread)
+            sample = record(payload, HOOK_DIR / 'telegram_notification_diagnostics.sqlite3',
+                            stored_status=status, stored_source=stored,
+                            composer_match=_composer_prediction_request(payload))
+            diagnostic = f'; diagnostic_sample={sample}'
+        except Exception as exc:
+            # Diagnostic failures never change forwarding or disclose values.
+            diagnostic = f'; diagnostic_unavailable={type(exc).__name__}'
+        log_error(f"preserved unclassified internal-shaped completion for {safe_id}; source=unknown{diagnostic}")
+    return False
+
+
+def is_empty_internal_exclusion_completion(payload: dict[str, Any]) -> bool:
+    """Suppress attributed safety-filter work, never a JSON-shaped user reply."""
+    return completion_thread_source(payload) == 'ambient_suggestion_safety'
+
+
+def route_completion(payload):
+    """One provenance gate for both completion transports, before any delivery."""
+    from . import completion_routing as routing, pending_completions as pending
+    decision = routing.classify(payload, SOURCE_STATE_ROOT)
+    if decision.deliver:
+        return decision
+    safe_id = decision.thread_id[:8] or 'unknown'
+    diagnostic = ''
+    if decision.kind == 'unknown':
+        try:
+            from .notification_diagnostics import record
+            sample = record(payload, HOOK_DIR / 'telegram_notification_diagnostics.sqlite3',
+                            stored_status=decision.stored_status, stored_source=decision.thread_source,
+                            composer_match=False, routing_decision=decision)
+            diagnostic = f'; diagnostic_sample={sample}'
+        except Exception as exc:
+            diagnostic = f'; diagnostic_unavailable={type(exc).__name__}'
+        try:
+            pending.defer(payload, decision, SOURCE_STATE_ROOT, HOOK_DIR / 'telegram_completions.sqlite3',
+                          generation=completion_generation())
+        except Exception as exc:
+            diagnostic += f'; verification_unavailable={type(exc).__name__}'
+    log_error(f'completion held for {safe_id}; kind={decision.kind}; reason={decision.reason}{diagnostic}')
+    return None
+
+
+def reserve_completion(payload):
+    from .pending_completions import reserve
+    return reserve(payload, SOURCE_STATE_ROOT, HOOK_DIR / 'telegram_completions.sqlite3')
+
+
+def completion_generation():
+    try:
+        state = json.loads(BOT_STATE_PATH.read_text(encoding='utf-8'))
+        return int(state.get('quiet_generation', 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
+
+
+def retry_pending_completions():
+    from .pending_completions import ready
+    try:
+        payloads = ready(SOURCE_STATE_ROOT, HOOK_DIR / 'telegram_completions.sqlite3',
+                         muted=notifications_muted(), generation=completion_generation())
+    except Exception as exc:
+        # Optional verification must not disable submission receipt/reaction work.
+        log_error(f'completion verification unavailable: {type(exc).__name__}')
+        return
+    for payload in payloads:
+        try:
+            send_desktop_notification(payload, '', _replay=True)
+        except Exception as exc:
+            log_error(f'completion replay unavailable: {type(exc).__name__}')
+
+
+def message_sections(parts: list[str]) -> str:
+    """Separate bot-authored UI fields as Markdown paragraphs.
+
+    Only section boundaries are normalized; Markdown inside a section (including
+    replies, tables, lists and code) is left intact. Do not apply to arbitrary text.
+    """
+    return "\n\n".join(part.strip("\n") for part in parts if part.strip("\n"))
+
+
+def build_user_input_request_message(payload: dict[str, Any]) -> str:
+    """Format a non-interactive alert for Desktop's request_user_input tool."""
+    cwd = str(payload.get("cwd") or "")
+    workspace = workspace_name(cwd)
+    session_id = str(payload.get("session_id") or payload.get("thread_id") or "")
+    tool_input = payload.get("tool_input")
+    questions = tool_input.get("questions") if isinstance(tool_input, dict) else None
+    lines = [
+        _t('**❓ Antigravity 正在等待你的回答**'),
+        _t('**工作区：** {p0}', p0=format(workspace, '')),
+    ]
+    if session_id:
+        lines.append(_t('**任务：** `{p0}`', p0=format(session_id[:8], '')))
+    if payload.get("permission_mode") == "plan":
+        lines.append(_t('**模式：** Plan'))
+
+    if isinstance(questions, list):
+        for question_index, question in enumerate(questions[:3], start=1):
+            if not isinstance(question, dict):
+                continue
+            header = str(question.get("header") or _t('问题 {p0}', p0=format(question_index, ''))).strip()
+            body = str(question.get("question") or _t('请输入回答')).strip()
+            lines.extend(["", f"**{question_index}. {header}**", body])
+            options = question.get("options")
+            if isinstance(options, list):
+                for option_index, option in enumerate(options[:4], start=1):
+                    if isinstance(option, dict):
+                        label = str(option.get("label") or _t('选项 {p0}', p0=format(option_index, ''))).strip()
+                        description = str(option.get("description") or "").strip()
+                    else:
+                        label = str(option).strip()
+                        description = ""
+                    option_line = f"{option_index}. {label}"
+                    if description:
+                        option_line += f" — {description}"
+                    lines.append(option_line)
+    lines.extend(["", _t('请回到 Antigravity 选择或输入回答。')])
+    message = message_sections(lines)
+    if len(message) > MAX_TELEGRAM_MESSAGE:
+        message = message[: MAX_TELEGRAM_MESSAGE - 1].rstrip() + "…"
+    return message
+
+
+def send_user_input_request_notification(payload: dict[str, Any]) -> int:
+    """Alert for Desktop prompts without attempting to answer them from the hook."""
+    if os.environ.get("CODEX_TELEGRAM_MANAGED_APP_SERVER") == "1":
+        return 0
+    if notifications_muted():
+        return 0
+
+    from .completion_routing import classify_question
+    decision = classify_question(payload, SOURCE_STATE_ROOT)
+    if not decision.deliver:
+        log_error('skipped user-input notification; source='+decision.kind+'; reason='+decision.reason)
+        return 0
+
+    loaded = load_config()
+    if loaded is None:
+        return 0
+    config, token = loaded
+    try:
+        subagent = {'agent_id': decision.thread_id} if decision.kind == 'subagent' else subagent_completion_context(payload)
+        if subagent is not None and not subagent_notifications_enabled(config):
+            return 0
+        session_id = decision.thread_id
+        display_payload = {**payload, 'session_id': session_id, 'thread_id': session_id}
+        request: dict[str, Any] = {
+            "chat_id": str(config["chat_id"]),
+            "text": build_user_input_request_message(display_payload),
+            "disable_notification": bool(config.get("silent")),
+        }
+        if session_id:
+            request["reply_markup"] = build_notification_keyboard(session_id)
+        if notifications_muted():
+            return 0
+        send_markdown_message(token, request)
+    except Exception as exc:
+        log_error(f"user-input notification failed: {exc}", token)
+    return 0
+
+
+CODEX_STATE_ROOT = codex_home()
+
+
+def _conversation_metadata(thread_id: str) -> dict[str, Any]:
+    """Read selected-profile Desktop metadata without model calls or caching."""
+    if not re.fullmatch(r"[A-Za-z0-9-]{6,64}", thread_id):
+        return {}
+    try:
+        databases = [p for p in CODEX_STATE_ROOT.glob("state_*.sqlite")
+                     if re.fullmatch(r"state_[0-9]+\.sqlite", p.name)]
+        databases.sort(key=lambda p: int(p.stem.split("_")[-1]), reverse=True)
+        for path in databases:
+            try:
+                db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)
+                try:
+                    columns = {r[1] for r in db.execute("PRAGMA table_info(threads)")}
+                    fields = [key for key in ("name", "title", "cwd") if key in columns]
+                    if "id" not in columns or not fields:
+                        continue
+                    row = db.execute("SELECT " + ",".join(fields) + " FROM threads WHERE id=?",
+                                     (thread_id,)).fetchone()
+                    if row:
+                        return dict(zip(fields, row))
+                finally:
+                    db.close()
+            except (OSError, sqlite3.Error):
+                continue
+    except OSError:
+        pass
+    try:
+        from ..codex.antigravity_store import read_conversation_summary
+        summary = read_conversation_summary(thread_id, SOURCE_STATE_ROOT)
+        if isinstance(summary, dict):
+            return {
+                "name": summary.get("name"),
+                "title": summary.get("name"),
+                "cwd": summary.get("cwd"),
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def conversation_title(thread_id: str) -> str:
+    for key, value in _conversation_metadata(thread_id).items():
+        if key in {"name", "title"} and isinstance(value, str) and value.strip():
+            title = " ".join(value.split())
+            return title if len(title) <= 180 else title[:179] + "…"
+    return _t('对话 {p0}', p0=thread_id[:8]) if thread_id else _t('Antigravity 对话')
+
+
+def conversation_workspace(thread_id: str) -> str:
+    cwd = _conversation_metadata(thread_id).get("cwd")
+    return workspace_name(cwd if isinstance(cwd, str) else "")
+
+
+def notification_heading(thread_id: str, icon: str = "🥳") -> str:
+    title = conversation_title(thread_id)
+    # Titles are literal metadata, not Markdown supplied by the user.
+    title = re.sub(r"([\\`*_{}\[\]()<>#+.!|~-])", r"\\\1", title)
+    return f"**{icon} {title}**"
+
+
+def build_message(payload: dict[str, Any], include_preview: bool, *, display_title: str | None = None, completed_at: str | None = None) -> str:
+    cwd = str(payload.get("cwd") or "")
+    workspace = workspace_name(cwd)
+    completed_at = completed_at or datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    thread_id = str(payload.get("thread_id") or payload.get("thread-id") or payload.get("session_id") or payload.get("agent_id") or "")
+    title = notification_heading(thread_id) if display_title is None else "**🥳 "+re.sub(r"([\\`*_{}\[\]()<>#+.!|~-])", r"\\\1", display_title)+"**"
+    lines = [
+        title,
+        _t('**工作区：** {p0}', p0=format(workspace, '')),
+        _t('**时间：** {p0}', p0=format(completed_at, '')),
+    ]
+
+    if payload.get("_is_subagent"):
+        lines.append(_t('**类型：** 子代理'))
+
+    model = payload.get("model")
+    if isinstance(model, str) and model.strip():
+        lines.insert(2, _t('**模型：** {p0}', p0=format(model.strip(), '')))
+
+    last_message = payload.get("last_assistant_message")
+    if include_preview and isinstance(last_message, str) and last_message.strip():
+        preview = markdown_preview(last_message, REPLY_PREVIEW_LIMIT)
+        if len(preview) > REPLY_PREVIEW_LIMIT:
+            preview = preview[: REPLY_PREVIEW_LIMIT - 1].rstrip() + "…"
+        lines.extend([_t('**最后回复：**'), preview])
+
+    message = "\n\n".join(lines)
+    if len(message) > MAX_TELEGRAM_MESSAGE:
+        message = message[: MAX_TELEGRAM_MESSAGE - 1].rstrip() + "…"
+    return message
+
+
+def send_hook_notification(payload: dict[str, Any]) -> int:
+    if os.environ.get('CODEX_TELEGRAM_SIDE_CHAT') == '1':
+        return 0  # The side-chat controller delivers and binds its own answer.
+    is_antigravity = isinstance(payload, dict) and ('conversationId' in payload or bool(payload.get('_antigravity_hook')))
+    if is_antigravity:
+        from ..codex.antigravity_store import (
+            consume_pending_control,
+            normalize_antigravity_hook_payload,
+            save_runtime_env,
+        )
+        save_runtime_env(os.environ, payload)
+        payload = normalize_antigravity_hook_payload(payload, home=SOURCE_STATE_ROOT)
+        if payload.get('hook_event_name') == 'PostInvocation':
+            ctrl = consume_pending_control(str(payload.get('conversationId') or payload.get('thread_id') or ''))
+            print(json.dumps(ctrl, ensure_ascii=False) if ctrl else '{}')
+            return 0
+        if payload.get('hook_event_name') == 'SessionStart':
+            print('{}')
+            return 0
+    hook_event = payload.get("hook_event_name")
+    try:
+        if hook_event == 'PreToolUse' and payload.get('tool_name') == 'request_user_input_async':
+            # The observer reads the authoritative agentMessage item and its ID;
+            # a pre-tool hook cannot safely invent the future question item ID.
+            from antigravity_telegram_bridge.features.async_inputs import hint_async_thread
+            hint_async_thread(str(payload.get('session_id') or payload.get('thread_id') or ''), HOOK_DIR)
+            return 0
+        if hook_event == "PreToolUse" and payload.get("tool_name") == "request_user_input":
+            return send_user_input_request_notification(payload)
+        if hook_event not in {"Stop", "SubagentStop"}:
+            return 0
+        if is_empty_suggestions_reply(payload):
+            log_error("skipped empty suggestions reply; evidence=exact-empty-suggestions-literal")
+            return 0
+        if notifications_muted():
+            return 0
+        decision = route_completion(payload)
+        if decision is None:
+            return 0
+
+        loaded = load_config()
+        if loaded is None:
+            return 0
+        config, token = loaded
+        try:
+            subagent = {'agent_id': decision.thread_id} if decision.kind == 'subagent' else subagent_completion_context(payload)
+            if subagent is not None and not subagent_notifications_enabled(config):
+                reserve_completion(payload)
+                agent_id = str(subagent.get("agent_id") or "")
+                suffix = f" for {agent_id[:8]}" if agent_id else ""
+                log_error(f"skipped subagent completion{suffix}")
+                return 0
+            if not reserve_completion(payload):
+                return 0
+            notification_payload = dict(payload)
+            notification_payload['thread_id'] = decision.thread_id
+            notification_payload["_is_subagent"] = subagent is not None
+            include_preview = bool(config.get("include_message_preview"))
+            thread_id = decision.thread_id
+            cache_id = cache_full_reply(notification_payload, thread_id) if include_preview else None
+            request: dict[str, Any] = {
+                "chat_id": str(config["chat_id"]),
+                "text": build_message(notification_payload, include_preview),
+                "disable_notification": bool(config.get("silent")),
+                "_local_image_base": str(payload.get("cwd") or ""),
+                "_local_image_text": payload.get("last_assistant_message") if include_preview else "",
+            }
+            resolve_desktop_submissions(token, thread_id)
+            attach_task_reply(token, request, thread_id, payload_turn_id(payload))
+            reply_markup = build_notification_keyboard(thread_id, cache_id)
+            if reply_markup:
+                request["reply_markup"] = reply_markup
+            if notifications_muted():
+                return 0
+            sent = send_markdown_message(
+                token,
+                request,
+            )
+            message_id = sent.get("message_id", "unknown") if isinstance(sent, dict) else "unknown"
+            log_error(f"notification delivered for {thread_id[:8]}; message_id={message_id}", token)
+            complete_payload_reactions(payload)
+        except Exception as exc:
+            log_error(f"notification failed: {exc}", token)
+        return 0
+    finally:
+        if is_antigravity:
+            if hook_event == "PreToolUse":
+                print(json.dumps({"decision": "allow"}))
+            elif hook_event in {"Stop", "SubagentStop"}:
+                print(json.dumps({"decision": "stop"}))
+
+
+def find_computer_use_notifier() -> Path | None:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return None
+    runtime_root = Path(local_app_data) / "OpenAI" / "Codex" / "runtimes" / "cua_node"
+    pattern = "*/bin/node_modules/@oai/sky/bin/windows/codex-computer-use.exe"
+    candidates = [path for path in runtime_root.glob(pattern) if path.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
+def forward_computer_use_notification(raw_payload: str) -> None:
+    """Preserve the Codex Desktop Computer Use turn-ended callback."""
+    executable = find_computer_use_notifier()
+    if executable is None:
+        log_error("computer-use notifier not found; Telegram notification still attempted")
+        return
+
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run(
+            [str(executable), "turn-ended", raw_payload],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+            creationflags=creation_flags,
+        )
+        if result.returncode != 0:
+            log_error(f"computer-use notifier exited with code {result.returncode}")
+    except Exception as exc:
+        log_error(f"computer-use notifier failed: {exc}")
+
+
+def send_desktop_notification(payload: dict[str, Any], raw_payload: str, *, _replay=False) -> int:
+    if not _replay:
+        forward_computer_use_notification(raw_payload)
+    if payload.get("type") != "agent-turn-complete":
+        return 0
+    if is_empty_suggestions_reply(payload):
+        log_error("skipped empty suggestions reply; evidence=exact-empty-suggestions-literal")
+        return 0
+    if notifications_muted():
+        return 0
+    decision = route_completion(payload)
+    if decision is None:
+        return 0
+
+    normalized = {
+        "thread_id": decision.thread_id,
+        "cwd": payload.get("cwd"),
+        "model": payload.get("model"),
+        "last_assistant_message": payload.get("last-assistant-message"),
+    }
+    loaded = load_config()
+    if loaded is None:
+        return 0
+    config, token = loaded
+    try:
+        subagent = {'agent_id': decision.thread_id} if decision.kind == 'subagent' else subagent_completion_context(payload)
+        if subagent is not None and not subagent_notifications_enabled(config):
+            reserve_completion(payload)  # Do not replay after a notification preference change.
+            thread_id = str(payload.get("thread-id") or "")
+            suffix = f" for {thread_id[:8]}" if thread_id else ""
+            log_error(f"skipped subagent completion{suffix}")
+            return 0
+        if not reserve_completion(payload):
+            return 0
+        include_preview = bool(config.get("include_message_preview"))
+        thread_id = decision.thread_id
+        normalized["_is_subagent"] = subagent is not None
+        cache_id = cache_full_reply(normalized, thread_id) if include_preview else None
+        request: dict[str, Any] = {
+            "chat_id": str(config["chat_id"]),
+            "text": build_message(
+                normalized,
+                include_preview,
+            ),
+            "disable_notification": bool(config.get("silent")),
+            "_local_image_base": str(payload.get("cwd") or ""),
+            "_local_image_text": payload.get("last-assistant-message") if include_preview else "",
+        }
+        resolve_desktop_submissions(token, thread_id)
+        attach_task_reply(token, request, thread_id, payload_turn_id(payload))
+        reply_markup = build_notification_keyboard(thread_id, cache_id)
+        if reply_markup:
+            request["reply_markup"] = reply_markup
+        if notifications_muted():
+            return 0
+        sent = send_markdown_message(
+            token,
+            request,
+        )
+        message_id = sent.get("message_id", "unknown") if isinstance(sent, dict) else "unknown"
+        proof = f"; verified_local_turn={decision.turn_trigger}" if decision.requires_turn_evidence else ""
+        log_error(f"desktop notification delivered for {thread_id[:8]}; message_id={message_id}{proof}", token)
+        complete_payload_reactions(payload)
+    except Exception as exc:
+        log_error(f"desktop notification failed: {exc}", token)
+    return 0
+
+
+def send_manual_test() -> int:
+    loaded = load_config()
+    if loaded is None:
+        print(_t('尚未配置，请先运行 --setup。'))
+        return 1
+    config, token = loaded
+    try:
+        send_message(
+            token,
+            {
+                "chat_id": str(config["chat_id"]),
+                "text": _t('🥳 Antigravity Telegram 手动测试成功'),
+                "disable_notification": bool(config.get("silent")),
+            },
+        )
+    except Exception as exc:
+        print(_t('测试失败：{p0}', p0=format(str(exc).replace(token, '<redacted-token>'), '')))
+        return 1
+    print(_t('测试消息已发送。'))
+    return 0
+
+
+def main() -> int:
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    if len(sys.argv) > 1 and sys.argv[1] == "--setup":
+        return setup()
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        return send_manual_test()
+
+    if len(sys.argv) > 1:
+        raw_payload = sys.argv[1]
+        try:
+            payload = json.loads(raw_payload)
+            if not isinstance(payload, dict):
+                raise ValueError("desktop notify input must be a JSON object")
+            return send_desktop_notification(payload, raw_payload)
+        except Exception as exc:
+            log_error(f"desktop notify input/configuration failed: {exc}")
+            return 0
+
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            raise ValueError("hook input must be a JSON object")
+        return send_hook_notification(payload)
+    except Exception as exc:
+        log_error(f"hook input/configuration failed: {exc}")
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
