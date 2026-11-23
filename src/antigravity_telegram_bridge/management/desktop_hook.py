@@ -161,7 +161,13 @@ def main(arguments=None):
                 return 0
             if hook_evt == 'PreToolUse':
                 out_json = json.dumps({'decision': 'allow'})
-            elif hook_evt in {'Stop', 'SubagentStop'}:
+            elif hook_evt == 'Stop':
+                stop_ctrl = consume_pending_control(
+                    str(payload.get('conversationId') or payload.get('thread_id') or ''),
+                    hook_event='Stop',
+                )
+                out_json = json.dumps(stop_ctrl if stop_ctrl else {'decision': 'stop'}, ensure_ascii=False)
+            elif hook_evt == 'SubagentStop':
                 out_json = json.dumps({'decision': 'stop'})
         # Filter before initializing/migrating a database or waking the service.
         if (os.environ.get('CODEX_TELEGRAM_MANAGED_APP_SERVER') != '1'

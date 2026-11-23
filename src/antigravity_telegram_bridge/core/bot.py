@@ -28,6 +28,11 @@ import uuid
 from antigravity_telegram_bridge.telegram.formatting import (
     diff_file_names, extract_quota_windows, format_account_credits, format_duration, format_quota_remaining, format_quota_reset, format_quota_reset_countdown, format_token_count
 )
+from antigravity_telegram_bridge.codex.antigravity_sdk import (
+    AntigravitySdkRuntime,
+    is_sdk_thread_id,
+    sdk_available,
+)
 from antigravity_telegram_bridge.codex.antigravity_store import (
     ANTIGRAVITY_MODELS,
     aggregate_antigravity_quota_stats,
@@ -43,6 +48,7 @@ from antigravity_telegram_bridge.codex.antigravity_store import (
     queue_pending_control,
     read_conversation_summary,
     run_agentapi,
+    save_runtime_env,
 )
 from antigravity_telegram_bridge.features.artifacts import (
     format_artifact_view_card,
@@ -218,6 +224,12 @@ class CodexAppServer:
         self._side_verified_generation = 0
         self._side_threads: set[str] = set()
         self._pending_antigravity_starts: dict[str, dict[str, str]] = {}
+        self._sdk_runtime: AntigravitySdkRuntime | None = None
+
+    def _get_sdk_runtime(self) -> AntigravitySdkRuntime:
+        if self._sdk_runtime is None:
+            self._sdk_runtime = AntigravitySdkRuntime(on_event=self.on_event)
+        return self._sdk_runtime
 
     def _use_antigravity_store(self) -> bool:
         return (
@@ -334,16 +346,34 @@ class CodexAppServer:
     ) -> dict[str, Any]:
         if method == "thread/list":
             limit = int(params.get("limit") or 100)
-            return {"data": list_antigravity_threads(limit=limit)}
+            merged: list[dict[str, Any]] = list(list_antigravity_threads(limit=limit))
+            seen = {str(item.get("id") or "") for item in merged if isinstance(item, dict)}
+            sdk = self._sdk_runtime
+            if sdk is not None or (data_dir() / "antigravity_sdk_threads.json").is_file():
+                for item in self._get_sdk_runtime().list_threads(limit=limit):
+                    if item["id"] not in seen:
+                        seen.add(item["id"])
+                        merged.append(item)
+            merged.sort(key=lambda item: item.get("updatedAt") or 0, reverse=True)
+            return {"data": merged[:limit]}
         if method == "thread/loaded/list":
             active_ids = [
                 str(item["id"])
                 for item in list_antigravity_threads(limit=50)
                 if (item.get("status") or {}).get("type") == "active"
             ]
+            if self._sdk_runtime is not None:
+                for item in self._sdk_runtime.list_threads(limit=50):
+                    if (item.get("status") or {}).get("type") == "active" and item["id"] not in active_ids:
+                        active_ids.append(item["id"])
             return {"data": active_ids}
         if method == "thread/read":
             tid = str(params.get("threadId") or "")
+            if is_sdk_thread_id(tid):
+                thread = self._get_sdk_runtime().read_thread(tid, include_turns=True)
+                if thread is None:
+                    raise RpcError(f"thread/read: thread not found: {tid}")
+                return {"thread": thread}
             thread = build_thread_from_antigravity(tid, include_turns=True)
             if thread is None:
                 raise RpcError(f"thread/read: thread not found: {tid}")
@@ -358,6 +388,14 @@ class CodexAppServer:
             return {"thread": {"id": temp_id, "cwd": cwd, "status": {"type": "idle"}}}
         if method == "thread/resume":
             tid = str(params.get("threadId") or "")
+            if is_sdk_thread_id(tid):
+                thread = self._get_sdk_runtime().read_thread(tid, include_turns=True) or {
+                    "id": tid,
+                    "cwd": str(params.get("cwd") or Path.home()),
+                    "status": {"type": "idle"},
+                    "turns": [],
+                }
+                return {"thread": thread}
             thread = build_thread_from_antigravity(tid, include_turns=True) or {
                 "id": tid,
                 "cwd": str(params.get("cwd") or Path.home()),
@@ -373,14 +411,13 @@ class CodexAppServer:
                 for part in inputs
                 if isinstance(part, dict) and part.get("type") == "text"
             ).strip()
-            runtime = load_runtime_env()
             if tid.startswith("agy-pending-"):
                 meta = self._pending_antigravity_starts.pop(tid, {})
                 cwd = meta.get("cwd") or str(Path.home())
                 model = str(meta.get("model") or "").strip()
-                if locate_agentapi() is not None and runtime.get("ANTIGRAVITY_LS_ADDRESS"):
-                    args = [f"--model={model}"] if model else []
-                    args.append(text)
+                args = [f"--model={model}"] if model else []
+                args.append(text)
+                try:
                     res = run_agentapi("new-conversation", args, cwd=cwd, timeout=timeout)
 
                     def _find_conv_id(node: Any) -> str:
@@ -396,17 +433,49 @@ class CodexAppServer:
                         return ""
 
                     real_id = _find_conv_id(res) or tid
-                else:
-                    real_id = tid
-                    queue_pending_control(real_id, inject_message=text)
-                return {"turn": {"id": "turn-0", "status": "inProgress"}, "threadId": real_id}
-            if locate_agentapi() is not None and runtime.get("ANTIGRAVITY_LS_ADDRESS"):
+                    return {"turn": {"id": "turn-0", "status": "inProgress"}, "threadId": real_id}
+                except DesktopIpcUnavailable as exc:
+                    if sdk_available():
+                        sdk = self._get_sdk_runtime()
+                        created = sdk.create_thread(cwd=cwd, model=model, title=text[:80])
+                        return sdk.start_turn(created["id"], text, cwd=cwd, model=model)
+                    raise DesktopIpcUnavailable(
+                        _t(
+                            "无法创建新的 Antigravity 任务：{p0}。如需脱离桌面端本地服务直接运行，请安装官方 SDK（`pip install google-antigravity`）。",
+                            p0=str(exc).rstrip("。."),
+                        )
+                    ) from exc
+            if is_sdk_thread_id(tid):
+                if not sdk_available():
+                    raise DesktopIpcUnavailable(
+                        _t("该任务由 Antigravity Python SDK 托管，但当前环境未安装 `google-antigravity`。")
+                    )
+                return self._get_sdk_runtime().start_turn(
+                    tid,
+                    text,
+                    cwd=str(params.get("cwd") or ""),
+                    model=str(params.get("model") or ""),
+                )
+            try:
                 run_agentapi("send-message", [tid, text], cwd=str(params.get("cwd") or ""), timeout=timeout)
-            else:
-                queue_pending_control(tid, inject_message=text)
+            except DesktopIpcUnavailable as exc:
+                summary = read_conversation_summary(tid) or {}
+                if (summary.get("status") or {}).get("type") == "active":
+                    queue_pending_control(tid, inject_message=text)
+                else:
+                    raise DesktopIpcUnavailable(
+                        _t(
+                            "无法向空闲的 Antigravity 桌面会话投递消息：{p0}。当前会话未在运行，无法通过 Hook 注入队列唤醒；请确认 Antigravity 连接可用，或发送 `/new` 创建新任务。",
+                            p0=str(exc).rstrip("。."),
+                        )
+                    ) from exc
             return {"turn": {"id": f"turn-{int(time.time())}", "status": "inProgress"}}
         if method == "turn/interrupt":
             tid = str(params.get("threadId") or "")
+            if is_sdk_thread_id(tid):
+                if self._sdk_runtime is not None:
+                    self._sdk_runtime.interrupt_turn(tid)
+                return {}
             cancel_antigravity_cascade(tid)
             return {}
         if method == "model/list":
@@ -643,8 +712,14 @@ class CodexAppServer:
             self.closed.set()
             self._fail_pending(_t('App Server 已停止'))
             job, self.child_job = self.child_job, None
+            sdk_runtime, self._sdk_runtime = self._sdk_runtime, None
             readers = self.readers
             cleanup_error = None
+            if sdk_runtime is not None:
+                try:
+                    sdk_runtime.stop()
+                except Exception as exc:
+                    cleanup_error = exc
             if job is not None:
                 try:
                     job.close()
@@ -1436,6 +1511,16 @@ class TelegramCodexBot:
                 client.stop()
 
     def _run_service(self, *, quiet_start: bool = False) -> int:
+        live_ls_addr = (
+            os.environ.get("ANTIGRAVITY_LS_ADDRESS", "").strip()
+            or os.environ.get("AGY_SERVER_ADDRESS", "").strip()
+        )
+        if live_ls_addr:
+            try:
+                save_runtime_env(os.environ)
+                log(f"captured live Antigravity LS runtime env on startup: {live_ls_addr}", self.token)
+            except Exception as exc:
+                log(f"failed to save startup Antigravity LS runtime env: {type(exc).__name__}", self.token)
         self._start_service_worker(self._outbox_worker, 'telegram-outbox')
         self._start_service_worker(self._reaction_worker, 'telegram-reactions')
         self.plugins.start()
@@ -2799,8 +2884,43 @@ class TelegramCodexBot:
         else:
             lines.extend([
                 "",
-                _t('暂未获取到模型额度信息，请确认 Antigravity 正在运行并已登录。'),
+                _t('⚠️ 远端窗口配额暂不可用，已切换为本地统计视图。'),
             ])
+            ls_error = str(agy_usage.get("lsError") or "").strip()
+            if ls_error:
+                lines.append(_t('**诊断：** `{p0}`', p0=format(truncate(ls_error, 180), '')))
+            current_model = str(agy_usage.get("currentModel") or "pro").strip()
+            total_convs = int(agy_usage.get("totalConversations") or 0)
+            active_convs = int(agy_usage.get("activeConversations") or 0)
+            total_tokens = int(agy_usage.get("totalTokens") or 0)
+            input_tokens = int(agy_usage.get("inputTokens") or 0)
+            cached_tokens = int(agy_usage.get("cachedInputTokens") or 0)
+            output_tokens = int(agy_usage.get("outputTokens") or 0)
+            lines.extend([
+                "",
+                _t('**📊 本地会话统计**'),
+                _t('**当前模型：** `{p0}`', p0=format(current_model, '')),
+                _t('**统计会话：** 最近 {p0} 个（运行中 {p1} 个）', p0=format(total_convs, ''), p1=format(active_convs, '')),
+            ])
+            if total_tokens > 0:
+                lines.append(
+                    _t(
+                        '**累计 Token：** {p0}（输入 {p1} · 缓存 {p2} · 输出 {p3}）',
+                        p0=format(format_token_count(total_tokens), ''),
+                        p1=format(format_token_count(input_tokens), ''),
+                        p2=format(format_token_count(cached_tokens), ''),
+                        p3=format(format_token_count(output_tokens), ''),
+                    )
+                )
+            recent_tasks = agy_usage.get("recentTasks")
+            if isinstance(recent_tasks, list) and recent_tasks:
+                lines.append(_t('**最近消耗任务：**'))
+                for task in recent_tasks[:3]:
+                    if not isinstance(task, dict):
+                        continue
+                    title = one_line(task.get("title") or str(task.get("id") or "")[:8], 36)
+                    tok = format_token_count(int(task.get("totalTokens") or 0))
+                    lines.append(f"- {title} · `{tok}`")
         rows: list[list[dict[str, str]]] = []
         if self.runtime_options:
             rows.append([
@@ -3324,7 +3444,29 @@ class TelegramCodexBot:
                 self.quota_resets._drain_events()
                 self._observe_quota(result)
                 self.quota_resets.maybe_execute()
-            if isinstance(result.get("antigravityUsage"), dict) or reset_credit_snapshot(result) is not None:
+            if isinstance(result.get("antigravityUsage"), dict):
+                agy_usage = result["antigravityUsage"]
+                if agy_usage.get("quotaGroups"):
+                    self._record_quota_monitor_success()
+                else:
+                    reason = str(agy_usage.get("lsError") or "Antigravity LS quota unavailable")
+                    now = int(time.time())
+                    with self.quota_monitor_lock:
+                        previous = self.state.snapshot().get("quota_monitor_health")
+                        if not isinstance(previous, dict):
+                            previous = {}
+                        failures = int(previous.get("consecutive_failures") or 0) + 1
+                        self.state.update(quota_monitor_health={
+                            "consecutive_failures": failures,
+                            "alerted": bool(previous.get("alerted")),
+                            "last_error": truncate(reason, 1000),
+                            "last_failure_at": now,
+                            "last_success_at": previous.get("last_success_at"),
+                            "ls_live_connected": False,
+                        })
+                    if failures == 1 or failures % 12 == 0:
+                        log(f"antigravity quota monitor degraded ({failures}x): {truncate(reason, 300)}", self.token)
+            elif reset_credit_snapshot(result) is not None:
                 self._record_quota_monitor_success()
             else:
                 self._record_quota_monitor_issue(
@@ -3676,6 +3818,8 @@ class TelegramCodexBot:
         )
 
     def _owns_thread(self, thread_id: str) -> bool:
+        if is_sdk_thread_id(thread_id):
+            return True
         entry = self.state.snapshot().get("managed_threads", {}).get(thread_id)
         # Before ownership was recorded, only /new omitted origin. Imported
         # Desktop/IDE tasks have the explicit unloaded_resumed origin.
@@ -3772,6 +3916,18 @@ class TelegramCodexBot:
         status = thread.get("status") if isinstance(thread, dict) else None
         status_type = status.get("type") if isinstance(status, dict) else None
         cwd = str(thread.get("cwd") or "") if isinstance(thread, dict) else ""
+        if is_sdk_thread_id(thread_id):
+            if status_type == "active":
+                raise ActiveWriterConflict(_t('该任务当前仍有运行中的 Turn。'))
+            turn_id = self._begin_turn(thread_id, text)
+            self._submission_feedback(thread_id, turn_id,
+                _t('▶️ 已发送到：{p0} · `{p1}`（Turn {p2}）', p0=format(self.task_names.get(thread_id, thread_id[:8]), ''), p1=format(thread_id[:8], ''), p2=format(turn_id[:8], '')),
+                {"inline_keyboard": [[
+                    {"text": _t('查看详情'), "callback_data": f"task|{thread_id}"},
+                    {"text": _t('💬 再次回复'), "callback_data": f"direct|{thread_id}"},
+                ]]},
+            )
+            return
         desktop_unavailable = None
         try:
             desktop_result = self._desktop_follow_up(thread_id, text, cwd)
@@ -3839,8 +3995,16 @@ class TelegramCodexBot:
         desktop_result: dict[str, Any],
     ) -> None:
         mode = str(desktop_result.get("mode") or "start")
+        route = str(desktop_result.get("route") or "")
         turn_id = str(desktop_result.get("turn_id") or "")
-        action = _t('已由 Antigravity 接收') if mode == "native" else (_t('已追加到运行中的') if mode == "steer" else _t('已发送到'))
+        if route == "antigravity-hook-control" or mode == "hook-control":
+            action = _t('已写入 Hook 队列（将在当前回合检查点注入）')
+        elif mode == "native":
+            action = _t('已由 Antigravity 接收')
+        elif mode == "steer":
+            action = _t('已追加到运行中的')
+        else:
+            action = _t('已发送到')
         turn_suffix = f"（Turn {turn_id[:8]}）" if turn_id else ""
         self._submission_feedback(thread_id, turn_id,
             f"💬 {action}：{self.task_names.get(thread_id, thread_id[:8])} · `{thread_id[:8]}`{turn_suffix}",

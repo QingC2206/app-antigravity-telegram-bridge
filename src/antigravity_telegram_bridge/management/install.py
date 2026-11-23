@@ -10,7 +10,7 @@ import sys
 
 import tomlkit
 
-from ..paths import codex_home, ensure_data_dir, hooks_json_path
+from ..paths import codex_home, ensure_data_dir, hooks_json_path, sidecar_json_path
 from ..codex.antigravity_store import save_runtime_env
 from . import services
 from .transaction import atomic_write as _write, install_files
@@ -20,6 +20,26 @@ from .hook_handlers import direct_command_arguments, partition_command_handlers
 def notify_command():
     return [sys.executable,'-m','antigravity_telegram_bridge','--codex-home',str(codex_home()),
             '--data-dir',str(ensure_data_dir()),'notify']
+
+
+def sidecar_definition():
+    return {
+        'command': str(Path(sys.executable).resolve()),
+        'args': [
+            '-m',
+            'antigravity_telegram_bridge',
+            '--codex-home',
+            str(codex_home()),
+            '--data-dir',
+            str(ensure_data_dir()),
+            'run',
+            '--quiet-start',
+        ],
+        'restart_policy': 'always',
+        'display_name': 'Antigravity Telegram Bridge',
+        'description': 'Telegram notifications, quota monitoring, task control, and bidirectional replies for Antigravity.',
+        'has_web_ui': False,
+    }
 
 
 def _owned_command(command):
@@ -74,16 +94,19 @@ def _hook_owned(entry):
     return bool(partition_command_handlers([entry], _owned_command)[1])
 
 
-def install(*, service=True, replace_notify=False):
+def install(*, service=True, replace_notify=False, sidecar=False):
     # Read-only preflight before touching user configuration.
     from ..codex.desktop import discover_desktop
     discover_desktop()
     data=ensure_data_dir(); profile=codex_home()
     config_path=profile/'config.toml'; hooks_path=profile/'hooks.json'; manifest_path=data/'bridge-install.json'
     agy_hooks_path=hooks_json_path()
+    sc_path=sidecar_json_path() if sidecar else None
     tracked_paths=[config_path,hooks_path,manifest_path]
     if agy_hooks_path.resolve()!=hooks_path.resolve():
         tracked_paths.append(agy_hooks_path)
+    if sc_path is not None:
+        tracked_paths.append(sc_path)
     originals={p:p.read_bytes() if p.exists() else None for p in tracked_paths}
     config=tomlkit.parse((originals[config_path] or b'').decode('utf-8-sig'))
     hooks=json.loads((originals[hooks_path] or b'{"hooks":{}}').decode('utf-8-sig'))
@@ -98,6 +121,8 @@ def install(*, service=True, replace_notify=False):
     manifest=json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else {
         'previous_notify':list(previous) if previous and not ours else None,'previous_hooks':[], 'schema':1}
     manifest['installed_notify']=command
+    if sc_path is not None:
+        manifest['sidecar_manifest']=str(sc_path)
     config['notify']=command
     container=hooks.setdefault('hooks',{})
     entries=container.get('PreToolUse',[])
@@ -127,12 +152,24 @@ def install(*, service=True, replace_notify=False):
                 'Stop': [cmd_entry],
             }
             files_to_install[agy_hooks_path]=(json.dumps(agy_hooks,ensure_ascii=False,indent=2)+'\n').encode()
-    install_files(files_to_install, service=service, originals=originals)
+    if sc_path is not None:
+        files_to_install[sc_path]=(json.dumps(sidecar_definition(),ensure_ascii=False,indent=2)+'\n').encode()
+    if sidecar:
+        try:
+            if services.snapshot().get('content') is not None:
+                services.manage('uninstall')
+        except Exception:
+            pass
+    install_files(files_to_install, service=(service and not sidecar), originals=originals)
     try:
         save_runtime_env(os.environ, data=data)
     except Exception:
         pass
-    print('Installed. Restart Antigravity to load hooks. Data: '+str(data))
+    if sidecar and sc_path is not None:
+        print('Installed as Antigravity Sidecar: '+str(sc_path))
+        print('Enable "Antigravity Telegram Bridge" in Antigravity Automations/Sidecars dashboard. Data: '+str(data))
+    else:
+        print('Installed. Restart Antigravity to load hooks. Data: '+str(data))
     return 0
 
 
@@ -141,7 +178,11 @@ def uninstall():
     if not manifest_path.exists():
         raise RuntimeError('No managed installation record; no configuration was changed.')
     manifest=json.loads(manifest_path.read_text(encoding='utf-8'))
-    services.manage('uninstall')
+    try:
+        if services.snapshot().get('content') is not None:
+            services.manage('uninstall')
+    except Exception:
+        services.manage('uninstall')
     path=codex_home()/'config.toml'
     if path.exists():
         config=tomlkit.parse(path.read_text(encoding='utf-8-sig'))
@@ -165,6 +206,15 @@ def uninstall():
                 agy_hooks.pop('antigravity-telegram-bridge',None)
                 _write(agy_hooks_path,(json.dumps(agy_hooks,ensure_ascii=False,indent=2)+'\n').encode())
         except (OSError,ValueError):
+            pass
+    sc_recorded = manifest.get('sidecar_manifest')
+    sc_path = Path(sc_recorded) if isinstance(sc_recorded, str) and sc_recorded else sidecar_json_path()
+    if sc_path.is_file():
+        try:
+            sc_path.unlink()
+            if sc_path.parent.is_dir() and not any(sc_path.parent.iterdir()):
+                sc_path.parent.rmdir()
+        except OSError:
             pass
     manifest_path.unlink()
     print('Hooks and service removed. Credentials, message routes and backups retained: '+str(data))

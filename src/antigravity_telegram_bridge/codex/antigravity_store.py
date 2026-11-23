@@ -11,21 +11,24 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Mapping
+from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit
 import urllib.request
 import ssl
 
 from ..i18n import tr as _t
-from ..paths import antigravity_home, ensure_data_dir
+from ..paths import antigravity_home, data_dir, ensure_data_dir
 from ..platforms.processes import spawn_options
+from .errors import DesktopIpcUnavailable, DesktopSubmissionUnknown
 
 DEFAULT_CONTEXT_WINDOW = 1_048_576
 ANTIGRAVITY_MODELS = [
     {
         "model": "pro",
-        "displayName": "Gemini 2.5 Pro (pro)",
+        "displayName": "Gemini Pro (pro)",
         "supportedReasoningEfforts": [
             {"reasoningEffort": "high"},
             {"reasoningEffort": "medium"},
@@ -34,7 +37,7 @@ ANTIGRAVITY_MODELS = [
     },
     {
         "model": "flash",
-        "displayName": "Gemini 2.5 Flash (flash)",
+        "displayName": "Gemini Flash (flash)",
         "supportedReasoningEfforts": [
             {"reasoningEffort": "medium"},
             {"reasoningEffort": "low"},
@@ -42,12 +45,32 @@ ANTIGRAVITY_MODELS = [
     },
     {
         "model": "flash_lite",
-        "displayName": "Gemini 2.5 Flash Lite (flash_lite)",
+        "displayName": "Gemini Flash Lite (flash_lite)",
         "supportedReasoningEfforts": [
             {"reasoningEffort": "low"},
         ],
     },
 ]
+
+_LS_DIAGNOSTIC_LOCK = threading.Lock()
+_LAST_LS_ERROR: dict[str, str] = {"method": "", "message": ""}
+
+
+def _record_ls_error(method: str, message: str) -> None:
+    with _LS_DIAGNOSTIC_LOCK:
+        _LAST_LS_ERROR["method"] = str(method or "")
+        _LAST_LS_ERROR["message"] = str(message or "").strip()
+
+
+def _clear_ls_error() -> None:
+    with _LS_DIAGNOSTIC_LOCK:
+        _LAST_LS_ERROR["method"] = ""
+        _LAST_LS_ERROR["message"] = ""
+
+
+def get_last_ls_error() -> str:
+    with _LS_DIAGNOSTIC_LOCK:
+        return _LAST_LS_ERROR.get("message", "")
 
 
 def summaries_db_path(home: Path | None = None) -> Path:
@@ -262,6 +285,7 @@ def _synthesize_summary_from_transcript(thread_id: str, t_path: Path, home: Path
     steps = read_transcript_steps(thread_id, home=home, explicit_path=t_path)
     first_user = ""
     last_text = ""
+    last_model = ""
     updated_at = 0.0
     for step in steps:
         ts = parse_iso_timestamp(step.get("created_at"))
@@ -271,8 +295,11 @@ def _synthesize_summary_from_transcript(thread_id: str, t_path: Path, home: Path
             cleaned = clean_user_input_text(step.get("content") or "")
             if cleaned and not first_user:
                 first_user = cleaned
-        elif step.get("type") == "PLANNER_RESPONSE" and step.get("content"):
-            last_text = str(step.get("content") or "").strip()
+        elif step.get("type") == "PLANNER_RESPONSE":
+            if step.get("model"):
+                last_model = str(step.get("model") or "").strip()
+            if step.get("content"):
+                last_text = str(step.get("content") or "").strip()
     if not updated_at:
         try:
             updated_at = t_path.stat().st_mtime
@@ -287,7 +314,7 @@ def _synthesize_summary_from_transcript(thread_id: str, t_path: Path, home: Path
         if active and _is_waiting_on_ask_question(thread_id, home):
             active_flags = ["waitingOnUserInput"]
     title = first_user.splitlines()[0][:80] if first_user else thread_id[:8]
-    return {
+    summary = {
         "id": thread_id,
         "name": title,
         "title": title,
@@ -304,6 +331,9 @@ def _synthesize_summary_from_transcript(thread_id: str, t_path: Path, home: Path
         "killed": False,
         "appDataDir": str(home),
     }
+    if last_model:
+        summary["model"] = last_model
+    return summary
 
 
 def list_antigravity_threads(
@@ -653,6 +683,11 @@ def build_thread_from_antigravity(
 
     thread = dict(summary)
     thread["turns"] = turns
+    if not thread.get("model"):
+        for step in reversed(steps):
+            if step.get("type") == "PLANNER_RESPONSE" and step.get("model"):
+                thread["model"] = str(step["model"]).strip()
+                break
     return thread
 
 
@@ -731,7 +766,10 @@ def _discover_live_language_server() -> list[tuple[str, str]]:
             if not csrf:
                 continue
             try:
-                conns = proc.net_connections(kind="inet")
+                if hasattr(proc, "net_connections"):
+                    conns = proc.net_connections(kind="inet")
+                else:
+                    conns = proc.connections(kind="inet")
             except Exception:
                 continue
             ports = sorted(
@@ -753,6 +791,20 @@ def _discover_live_language_server() -> list[tuple[str, str]]:
     return candidates
 
 
+def _format_rpc_exception(addr: str, scheme: str, exc: BaseException) -> str:
+    if isinstance(exc, HTTPError):
+        code = getattr(exc, "code", "")
+        if code in (401, 403):
+            return f"HTTP {code} auth/CSRF rejected ({scheme}://{addr})"
+        if code == 404:
+            return f"HTTP 404 RPC method unavailable ({scheme}://{addr})"
+        return f"HTTP {code} ({scheme}://{addr})"
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", exc)
+        return f"{type(reason).__name__}: {reason} ({scheme}://{addr})"
+    return f"{type(exc).__name__}: {exc} ({scheme}://{addr})"
+
+
 def _call_ls_rpc(
     address: str,
     csrf_token: str,
@@ -772,6 +824,7 @@ def _call_ls_rpc(
     }
     if csrf_token:
         headers["x-codeium-csrf-token"] = csrf_token
+    last_err = ""
     for scheme in ("http", "https"):
         url = f"{scheme}://{addr}/exa.language_server_pb.LanguageServerService/{method}"
         req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
@@ -781,9 +834,14 @@ def _call_ls_rpc(
                 raw = resp.read().decode("utf-8", errors="replace")
                 parsed = json.loads(raw)
                 if isinstance(parsed, dict):
+                    _clear_ls_error()
                     return parsed
-        except Exception:
+                last_err = f"non-object JSON response ({scheme}://{addr})"
+        except Exception as exc:
+            last_err = _format_rpc_exception(addr, scheme, exc)
             continue
+    if last_err:
+        _record_ls_error(method, last_err)
     return None
 
 
@@ -799,6 +857,51 @@ def _parse_iso_epoch(value: Any) -> int | None:
         return None
 
 
+def runtime_connection_candidates(
+    data: Path | None = None,
+    *,
+    include_discovery: bool = True,
+) -> list[tuple[str, str]]:
+    """Return deduplicated (address, csrf_token) pairs in priority order.
+
+    1. Live process environment variables (when data is None).
+    2. Persisted antigravity_runtime.json primary & secondary pairs.
+    3. Best-effort live process discovery (when data is None and include_discovery is True).
+    """
+    candidates: list[tuple[str, str]] = []
+
+    def _add(addr: Any, csrf: Any) -> None:
+        a = str(addr or "").strip()
+        c = str(csrf or "").strip()
+        if not a:
+            return
+        pair = (a, c)
+        if pair not in candidates:
+            candidates.append(pair)
+
+    if data is None:
+        env_ls_addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "").strip()
+        env_ls_csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "").strip()
+        env_agy_addr = os.environ.get("AGY_SERVER_ADDRESS", "").strip()
+        env_agy_csrf = os.environ.get("AGY_CSRF_TOKEN", "").strip()
+        _add(env_ls_addr, env_ls_csrf or env_agy_csrf)
+        _add(env_agy_addr, env_agy_csrf or env_ls_csrf)
+
+    stored = _load_runtime_file(data)
+    st_ls_addr = str(stored.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
+    st_ls_csrf = str(stored.get("ANTIGRAVITY_CSRF_TOKEN") or "").strip()
+    st_agy_addr = str(stored.get("AGY_SERVER_ADDRESS") or "").strip()
+    st_agy_csrf = str(stored.get("AGY_CSRF_TOKEN") or "").strip()
+    _add(st_ls_addr, st_ls_csrf or st_agy_csrf)
+    _add(st_agy_addr, st_agy_csrf or st_ls_csrf)
+
+    if data is None and include_discovery:
+        for pair in _discover_live_language_server():
+            _add(pair[0], pair[1])
+
+    return candidates
+
+
 def _call_live_ls_rpc(
     method: str,
     payload: dict[str, Any] | None = None,
@@ -806,23 +909,34 @@ def _call_live_ls_rpc(
     data: Path | None = None,
     timeout: float = 4.0,
 ) -> dict[str, Any] | None:
-    runtime_info = load_runtime_env(data)
-    candidates: list[tuple[str, str]] = []
-    saved_addr = str(runtime_info.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
-    saved_csrf = str(runtime_info.get("ANTIGRAVITY_CSRF_TOKEN") or "").strip()
-    if saved_addr:
-        candidates.append((saved_addr, saved_csrf))
-    if data is None:
-        for pair in _discover_live_language_server():
-            if pair not in candidates:
-                candidates.append(pair)
+    stored = _load_runtime_file(data)
+    saved_addr = str(stored.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
+    saved_csrf = str(stored.get("ANTIGRAVITY_CSRF_TOKEN") or "").strip()
+    candidates = runtime_connection_candidates(data=data, include_discovery=(data is None))
+    if not candidates:
+        _record_ls_error(method, "no Antigravity LS endpoint configured or discovered")
+        return None
     for addr, csrf in candidates:
         res = _call_ls_rpc(addr, csrf, method, payload or {}, timeout=timeout)
         if isinstance(res, dict):
-            if (addr != saved_addr or csrf != saved_csrf) and data is None:
+            _clear_ls_error()
+            if (
+                data is None
+                and (
+                    addr != saved_addr
+                    or csrf != saved_csrf
+                    or str(stored.get("AGY_SERVER_ADDRESS") or "").strip() != addr
+                    or str(stored.get("AGY_CSRF_TOKEN") or "").strip() != csrf
+                )
+            ):
                 try:
                     save_runtime_env(
-                        {"ANTIGRAVITY_LS_ADDRESS": addr, "ANTIGRAVITY_CSRF_TOKEN": csrf},
+                        {
+                            "ANTIGRAVITY_LS_ADDRESS": addr,
+                            "ANTIGRAVITY_CSRF_TOKEN": csrf,
+                            "AGY_SERVER_ADDRESS": addr,
+                            "AGY_CSRF_TOKEN": csrf,
+                        },
                         data=data,
                     )
                 except Exception:
@@ -967,12 +1081,18 @@ def aggregate_antigravity_quota_stats(
 ) -> dict[str, Any]:
     root = home or antigravity_home()
     runtime_info = load_runtime_env(data)
+    threads = list_antigravity_threads(root, limit=limit, include_subagents=False)
+    transcript_model = ""
+    for thread in threads:
+        if thread.get("model"):
+            transcript_model = str(thread["model"]).strip()
+            break
     model_name = (
         current_model
         or runtime_info.get("model_name")
-        or "pro (Gemini 2.5 Pro)"
+        or transcript_model
+        or "pro"
     )
-    threads = list_antigravity_threads(root, limit=limit, include_subagents=False)
     active_count = sum(
         1 for t in threads if (t.get("status") or {}).get("type") == "active"
     )
@@ -1002,6 +1122,7 @@ def aggregate_antigravity_quota_stats(
                 }
             )
     quota_groups = fetch_antigravity_quota_groups(data=data)
+    ls_error = "" if quota_groups else get_last_ls_error()
     runtime_info = load_runtime_env(data)
     return {
         "antigravityUsage": {
@@ -1014,6 +1135,8 @@ def aggregate_antigravity_quota_stats(
             "outputTokens": sum_out,
             "recentTasks": recent_usage,
             "lsConnected": bool(runtime_info.get("ANTIGRAVITY_LS_ADDRESS")) or bool(quota_groups),
+            "lsLiveConnected": bool(quota_groups),
+            "lsError": ls_error,
             "quotaGroups": quota_groups,
         }
     }
@@ -1023,6 +1146,75 @@ def _runtime_env_path(data: Path | None = None) -> Path:
     return (data or ensure_data_dir()) / "antigravity_runtime.json"
 
 
+_RUNTIME_ENV_KEYS = (
+    "ANTIGRAVITY_LS_ADDRESS",
+    "ANTIGRAVITY_CSRF_TOKEN",
+    "ANTIGRAVITY_AGENTAPI_EXE",
+    "ANTIGRAVITY_APP_DATA_DIR",
+    "ANTIGRAVITY_LS_VERSION",
+    "ANTIGRAVITY_PROJECT_ID",
+    "AGY_SERVER_ADDRESS",
+    "AGY_CSRF_TOKEN",
+)
+
+
+def _load_runtime_file(data: Path | None = None) -> dict[str, Any]:
+    path = _runtime_env_path(data)
+    if not path.is_file():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return dict(loaded) if isinstance(loaded, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _merge_runtime_env(
+    base: Mapping[str, Any],
+    incoming: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Overlay incoming env values onto base and keep LS/AGY alias pairs synchronized.
+
+    When incoming provides only one member of an alias pair (for example,
+    AGY_SERVER_ADDRESS without ANTIGRAVITY_LS_ADDRESS, or vice versa), both
+    keys update to the fresh incoming value so a stale cached key never pins
+    requests to a dead port or expired CSRF token.
+    """
+    merged = dict(base)
+    provided: dict[str, str] = {}
+    for key in _RUNTIME_ENV_KEYS:
+        val = str(incoming.get(key) or "").strip()
+        if val:
+            merged[key] = val
+            provided[key] = val
+
+    in_ls_addr = provided.get("ANTIGRAVITY_LS_ADDRESS", "")
+    in_agy_addr = provided.get("AGY_SERVER_ADDRESS", "")
+    if in_ls_addr and not in_agy_addr:
+        merged["AGY_SERVER_ADDRESS"] = in_ls_addr
+    elif in_agy_addr and not in_ls_addr:
+        merged["ANTIGRAVITY_LS_ADDRESS"] = in_agy_addr
+
+    in_ls_csrf = provided.get("ANTIGRAVITY_CSRF_TOKEN", "")
+    in_agy_csrf = provided.get("AGY_CSRF_TOKEN", "")
+    if in_ls_csrf and not in_agy_csrf:
+        merged["AGY_CSRF_TOKEN"] = in_ls_csrf
+    elif in_agy_csrf and not in_ls_csrf:
+        merged["ANTIGRAVITY_CSRF_TOKEN"] = in_agy_csrf
+
+    # Fill missing aliases when loading legacy/partial files.
+    if merged.get("AGY_SERVER_ADDRESS") and not merged.get("ANTIGRAVITY_LS_ADDRESS"):
+        merged["ANTIGRAVITY_LS_ADDRESS"] = merged["AGY_SERVER_ADDRESS"]
+    elif merged.get("ANTIGRAVITY_LS_ADDRESS") and not merged.get("AGY_SERVER_ADDRESS"):
+        merged["AGY_SERVER_ADDRESS"] = merged["ANTIGRAVITY_LS_ADDRESS"]
+    if merged.get("AGY_CSRF_TOKEN") and not merged.get("ANTIGRAVITY_CSRF_TOKEN"):
+        merged["ANTIGRAVITY_CSRF_TOKEN"] = merged["AGY_CSRF_TOKEN"]
+    elif merged.get("ANTIGRAVITY_CSRF_TOKEN") and not merged.get("AGY_CSRF_TOKEN"):
+        merged["AGY_CSRF_TOKEN"] = merged["ANTIGRAVITY_CSRF_TOKEN"]
+
+    return merged
+
+
 def save_runtime_env(
     env: Mapping[str, str] | None = None,
     payload: Mapping[str, Any] | None = None,
@@ -1030,29 +1222,8 @@ def save_runtime_env(
 ) -> dict[str, Any]:
     source_env = env if env is not None else os.environ
     path = _runtime_env_path(data)
-    existing = load_runtime_env(data)
-    updated = dict(existing)
-    for key in (
-        "ANTIGRAVITY_LS_ADDRESS",
-        "ANTIGRAVITY_CSRF_TOKEN",
-        "ANTIGRAVITY_AGENTAPI_EXE",
-        "ANTIGRAVITY_APP_DATA_DIR",
-        "ANTIGRAVITY_LS_VERSION",
-        "ANTIGRAVITY_PROJECT_ID",
-        "AGY_SERVER_ADDRESS",
-        "AGY_CSRF_TOKEN",
-    ):
-        val = str(source_env.get(key) or "").strip()
-        if val:
-            updated[key] = val
-    if updated.get("AGY_SERVER_ADDRESS") and not updated.get("ANTIGRAVITY_LS_ADDRESS"):
-        updated["ANTIGRAVITY_LS_ADDRESS"] = updated["AGY_SERVER_ADDRESS"]
-    elif updated.get("ANTIGRAVITY_LS_ADDRESS") and not updated.get("AGY_SERVER_ADDRESS"):
-        updated["AGY_SERVER_ADDRESS"] = updated["ANTIGRAVITY_LS_ADDRESS"]
-    if updated.get("AGY_CSRF_TOKEN") and not updated.get("ANTIGRAVITY_CSRF_TOKEN"):
-        updated["ANTIGRAVITY_CSRF_TOKEN"] = updated["AGY_CSRF_TOKEN"]
-    elif updated.get("ANTIGRAVITY_CSRF_TOKEN") and not updated.get("AGY_CSRF_TOKEN"):
-        updated["AGY_CSRF_TOKEN"] = updated["ANTIGRAVITY_CSRF_TOKEN"]
+    existing = _load_runtime_file(data)
+    updated = _merge_runtime_env(existing, source_env)
     if isinstance(payload, Mapping):
         model_name = str(payload.get("modelName") or "").strip()
         if model_name:
@@ -1086,37 +1257,17 @@ def save_runtime_env(
 
 
 def load_runtime_env(data: Path | None = None) -> dict[str, Any]:
-    path = _runtime_env_path(data)
-    stored: dict[str, Any] = {}
-    if path.is_file():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                stored = loaded
-        except (OSError, ValueError):
-            stored = {}
-    for key in (
-        "ANTIGRAVITY_LS_ADDRESS",
-        "ANTIGRAVITY_CSRF_TOKEN",
-        "ANTIGRAVITY_AGENTAPI_EXE",
-        "ANTIGRAVITY_APP_DATA_DIR",
-        "ANTIGRAVITY_LS_VERSION",
-        "ANTIGRAVITY_PROJECT_ID",
-        "AGY_SERVER_ADDRESS",
-        "AGY_CSRF_TOKEN",
-    ):
-        env_val = os.environ.get(key, "").strip()
-        if env_val:
-            stored[key] = env_val
-    if stored.get("AGY_SERVER_ADDRESS") and not stored.get("ANTIGRAVITY_LS_ADDRESS"):
-        stored["ANTIGRAVITY_LS_ADDRESS"] = stored["AGY_SERVER_ADDRESS"]
-    elif stored.get("ANTIGRAVITY_LS_ADDRESS") and not stored.get("AGY_SERVER_ADDRESS"):
-        stored["AGY_SERVER_ADDRESS"] = stored["ANTIGRAVITY_LS_ADDRESS"]
-    if stored.get("AGY_CSRF_TOKEN") and not stored.get("ANTIGRAVITY_CSRF_TOKEN"):
-        stored["ANTIGRAVITY_CSRF_TOKEN"] = stored["AGY_CSRF_TOKEN"]
-    elif stored.get("ANTIGRAVITY_CSRF_TOKEN") and not stored.get("AGY_CSRF_TOKEN"):
-        stored["AGY_CSRF_TOKEN"] = stored["ANTIGRAVITY_CSRF_TOKEN"]
-    return stored
+    stored = _load_runtime_file(data)
+    if data is None:
+        return _merge_runtime_env(stored, os.environ)
+    # Isolated data directories (tests/custom profiles) should not be silently
+    # hijacked by unrelated host shell env vars once persisted values exist.
+    fallback_env = {
+        key: val
+        for key in _RUNTIME_ENV_KEYS
+        if not stored.get(key) and (val := os.environ.get(key, "").strip())
+    }
+    return _merge_runtime_env(stored, fallback_env)
 
 
 def locate_agentapi(home: Path | None = None, data: Path | None = None) -> Path | None:
@@ -1142,6 +1293,62 @@ def locate_agentapi(home: Path | None = None, data: Path | None = None) -> Path 
     return None
 
 
+_PRE_CONNECT_MARKERS = (
+    "antigravity_ls_address is not set",
+    "error while dialing",
+    "connection refused",
+    "actively refused",
+    "connectex",
+    "no connection could be made",
+    "cannot assign requested address",
+    "unauthenticated",
+    "invalid csrf",
+    "csrf token",
+    "permissiondenied",
+    "permission denied",
+)
+
+
+def _is_pre_connect_agentapi_error(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return any(marker in lowered for marker in _PRE_CONNECT_MARKERS)
+
+
+def _parse_agentapi_completed(
+    subcommand: str,
+    completed: subprocess.CompletedProcess[str],
+) -> tuple[dict[str, Any] | None, str]:
+    stdout = (completed.stdout or "").strip()
+    parsed_dict: dict[str, Any] | None = None
+    if stdout:
+        for line in reversed(stdout.splitlines()):
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    candidate = json.loads(line)
+                    if isinstance(candidate, dict):
+                        parsed_dict = candidate
+                        break
+                except ValueError:
+                    pass
+        if parsed_dict is None:
+            try:
+                candidate = json.loads(stdout)
+                if isinstance(candidate, dict):
+                    parsed_dict = candidate
+            except ValueError:
+                pass
+    if isinstance(parsed_dict, dict):
+        if parsed_dict.get("error"):
+            return None, str(parsed_dict["error"]).strip()
+        if completed.returncode == 0:
+            return parsed_dict, ""
+    if completed.returncode != 0:
+        err = (completed.stderr or stdout or f"exit {completed.returncode}").strip()
+        return None, f"agentapi {subcommand} failed: {err}"
+    return {"response": {}}, ""
+
+
 def run_agentapi(
     subcommand: str,
     args: list[str],
@@ -1153,37 +1360,33 @@ def run_agentapi(
 ) -> dict[str, Any]:
     exe = locate_agentapi(home, data)
     if exe is None:
-        raise FileNotFoundError(_t("未找到 Antigravity agentapi 工具（~/.gemini/antigravity/bin/agentapi）。"))
+        raise DesktopIpcUnavailable(_t("未找到 Antigravity agentapi 工具（~/.gemini/antigravity/bin/agentapi）。"))
     runtime = load_runtime_env(data)
-    ls_address = str(runtime.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
-    if not ls_address and data is None:
-        live_pairs = _discover_live_language_server()
-        if live_pairs:
-            addr, csrf = live_pairs[0]
-            runtime = save_runtime_env(
-                {"ANTIGRAVITY_LS_ADDRESS": addr, "ANTIGRAVITY_CSRF_TOKEN": csrf},
-                data=data,
-            )
-            ls_address = addr
-    if not ls_address:
-        raise RuntimeError(
+    candidates = runtime_connection_candidates(data=data, include_discovery=(data is None))
+    if not candidates:
+        raise DesktopIpcUnavailable(
             _t("尚未捕获 Antigravity Language Server 连接信息。请先在 Antigravity 中开启或继续任意对话以触发一次 Hook。")
         )
 
-    def _exec(rt: Mapping[str, Any]) -> subprocess.CompletedProcess[str]:
+    mutating = subcommand in {"send-message", "new-conversation"}
+    stored = _load_runtime_file(data)
+    saved_addr = str(stored.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
+    saved_csrf = str(stored.get("ANTIGRAVITY_CSRF_TOKEN") or "").strip()
+
+    def _exec(addr: str, csrf: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
-        for key in (
-            "ANTIGRAVITY_LS_ADDRESS",
-            "ANTIGRAVITY_CSRF_TOKEN",
-            "ANTIGRAVITY_AGENTAPI_EXE",
-            "ANTIGRAVITY_APP_DATA_DIR",
-            "ANTIGRAVITY_LS_VERSION",
-            "ANTIGRAVITY_PROJECT_ID",
-            "AGY_SERVER_ADDRESS",
-            "AGY_CSRF_TOKEN",
-        ):
-            if rt.get(key):
-                env[key] = str(rt[key])
+        for key in _RUNTIME_ENV_KEYS:
+            if runtime.get(key):
+                env[key] = str(runtime[key])
+        # Ensure agentapi always receives a synchronized address/CSRF pair.
+        env["ANTIGRAVITY_LS_ADDRESS"] = addr
+        env["AGY_SERVER_ADDRESS"] = addr
+        if csrf:
+            env["ANTIGRAVITY_CSRF_TOKEN"] = csrf
+            env["AGY_CSRF_TOKEN"] = csrf
+        else:
+            env.pop("ANTIGRAVITY_CSRF_TOKEN", None)
+            env.pop("AGY_CSRF_TOKEN", None)
         if "language_server" in exe.stem.lower():
             cmd = [str(exe), "agentapi", subcommand, *args]
         else:
@@ -1201,42 +1404,60 @@ def run_agentapi(
             **spawn_options(),
         )
 
-    completed = _exec(runtime)
-    if completed.returncode != 0 and data is None:
-        for addr, csrf in _discover_live_language_server():
-            if addr != ls_address:
-                runtime = save_runtime_env(
-                    {"ANTIGRAVITY_LS_ADDRESS": addr, "ANTIGRAVITY_CSRF_TOKEN": csrf},
-                    data=data,
-                )
-                completed = _exec(runtime)
-                if completed.returncode == 0:
-                    break
-    stdout = (completed.stdout or "").strip()
-    if stdout:
-        for line in reversed(stdout.splitlines()):
-            line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                try:
-                    parsed = json.loads(line)
-                    if isinstance(parsed, dict):
-                        if parsed.get("error"):
-                            raise RuntimeError(str(parsed["error"]))
-                        return parsed
-                except ValueError:
-                    pass
+    last_pre_connect_err = ""
+    for addr, csrf in candidates:
         try:
-            parsed = json.loads(stdout)
-            if isinstance(parsed, dict):
-                if parsed.get("error"):
-                    raise RuntimeError(str(parsed["error"]))
-                return parsed
-        except ValueError:
-            pass
-    if completed.returncode != 0:
-        err = (completed.stderr or stdout or f"exit {completed.returncode}").strip()
-        raise RuntimeError(f"agentapi {subcommand} failed: {err}")
-    return {"response": {}}
+            completed = _exec(addr, csrf)
+        except subprocess.TimeoutExpired as exc:
+            _record_ls_error(f"agentapi:{subcommand}", f"timeout connecting/executing ({addr})")
+            if mutating:
+                raise DesktopSubmissionUnknown(
+                    _t("Antigravity agentapi 执行超时，提交结果未知。请先核对任务状态，避免重复发送。")
+                ) from exc
+            last_pre_connect_err = f"timeout ({addr})"
+            continue
+        except OSError as exc:
+            _record_ls_error(f"agentapi:{subcommand}", f"spawn error: {exc}")
+            raise DesktopIpcUnavailable(f"agentapi {subcommand} failed: {exc}") from exc
+
+        parsed, err = _parse_agentapi_completed(subcommand, completed)
+        if parsed is not None:
+            _clear_ls_error()
+            if data is None and (
+                addr != saved_addr
+                or csrf != saved_csrf
+                or str(stored.get("AGY_SERVER_ADDRESS") or "").strip() != addr
+                or str(stored.get("AGY_CSRF_TOKEN") or "").strip() != csrf
+            ):
+                try:
+                    save_runtime_env(
+                        {
+                            "ANTIGRAVITY_LS_ADDRESS": addr,
+                            "ANTIGRAVITY_CSRF_TOKEN": csrf,
+                            "AGY_SERVER_ADDRESS": addr,
+                            "AGY_CSRF_TOKEN": csrf,
+                        },
+                        data=data,
+                    )
+                except Exception:
+                    pass
+            return parsed
+
+        _record_ls_error(f"agentapi:{subcommand}", err)
+        if _is_pre_connect_agentapi_error(err):
+            last_pre_connect_err = err
+            continue
+        if mutating:
+            # Non-pre-connect error on a mutation could have reached the server;
+            # never silently try another endpoint or resend.
+            raise DesktopSubmissionUnknown(
+                _t("Antigravity 未确认提交结果：{p0}。请先查看任务，避免重复发送。", p0=err[:300])
+            )
+        raise RuntimeError(err)
+
+    raise DesktopIpcUnavailable(
+        _t("无法连接当前 Antigravity 本地服务（已尝试 {p0} 个地址，最近错误：{p1}）。", p0=str(len(candidates)), p1=last_pre_connect_err[:260])
+    )
 
 
 def _control_queue_path(data: Path | None = None) -> Path:
@@ -1296,6 +1517,7 @@ def consume_pending_control(
     thread_id: str,
     *,
     data: Path | None = None,
+    hook_event: str = "PostInvocation",
 ) -> dict[str, Any]:
     if not thread_id:
         return {}
@@ -1329,6 +1551,18 @@ def consume_pending_control(
     if not isinstance(entry, dict):
         return {}
     if time.time() - float(entry.get("updated_at") or 0) > 3600:
+        return {}
+    if hook_event == "Stop":
+        if entry.get("stop"):
+            return {"decision": "stop"}
+        msgs = entry.get("messages")
+        if isinstance(msgs, list) and msgs:
+            clean_msgs = [str(m) for m in msgs if str(m).strip()]
+            if clean_msgs:
+                return {
+                    "decision": "continue",
+                    "reason": "User follow-up from Telegram:\n" + "\n\n".join(clean_msgs),
+                }
         return {}
     response: dict[str, Any] = {}
     if entry.get("stop"):
@@ -1414,8 +1648,9 @@ def normalize_antigravity_hook_payload(
         payload.get("modelName")
         or payload.get("model")
         or summary.get("model")
+        or thread.get("model")
         or runtime_env.get("model_name")
-        or "pro (Gemini 2.5 Pro)"
+        or "pro"
     )
 
     normalized: dict[str, Any] = {

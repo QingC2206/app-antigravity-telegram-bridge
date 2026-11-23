@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["build>=1.2", "wheel", "packaging>=23"]
+sdk = ["google-antigravity"]
 
 [project.scripts]
 antigravity-telegram-bridge = "antigravity_telegram_bridge.cli:main"

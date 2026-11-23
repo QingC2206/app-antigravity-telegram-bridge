@@ -496,6 +496,355 @@ class AntigravityStoreAndArtifactsTests(unittest.TestCase):
             self.assertIn(("CancelCascadeInvocation", {"cascadeId": self.thread_id}), rpc_calls)
             self.assertIn(("ForceStopCascadeTree", {"conversationId": self.thread_id}), rpc_calls)
 
+    def test_save_runtime_env_syncs_agy_and_ls_aliases_without_stale_lockin(self):
+        agy_store.save_runtime_env(
+            {"ANTIGRAVITY_LS_ADDRESS": "localhost:58261", "ANTIGRAVITY_CSRF_TOKEN": "old-csrf"},
+            data=self.data,
+        )
+        # Updating only AGY_SERVER_ADDRESS / AGY_CSRF_TOKEN must overwrite stale ANTIGRAVITY_LS_* values.
+        updated = agy_store.save_runtime_env(
+            {"AGY_SERVER_ADDRESS": "localhost:55429", "AGY_CSRF_TOKEN": "new-csrf"},
+            data=self.data,
+        )
+        self.assertEqual(updated["ANTIGRAVITY_LS_ADDRESS"], "localhost:55429")
+        self.assertEqual(updated["AGY_SERVER_ADDRESS"], "localhost:55429")
+        self.assertEqual(updated["ANTIGRAVITY_CSRF_TOKEN"], "new-csrf")
+        self.assertEqual(updated["AGY_CSRF_TOKEN"], "new-csrf")
+
+        # Updating only ANTIGRAVITY_LS_* must likewise overwrite stale AGY_* values.
+        updated2 = agy_store.save_runtime_env(
+            {"ANTIGRAVITY_LS_ADDRESS": "localhost:56272", "ANTIGRAVITY_CSRF_TOKEN": "fresh-csrf"},
+            data=self.data,
+        )
+        self.assertEqual(updated2["ANTIGRAVITY_LS_ADDRESS"], "localhost:56272")
+        self.assertEqual(updated2["AGY_SERVER_ADDRESS"], "localhost:56272")
+        self.assertEqual(updated2["ANTIGRAVITY_CSRF_TOKEN"], "fresh-csrf")
+        self.assertEqual(updated2["AGY_CSRF_TOKEN"], "fresh-csrf")
+
+    def test_run_agentapi_retries_pre_connect_and_blocks_retry_on_uncertain_mutation(self):
+        import subprocess
+        from antigravity_telegram_bridge.codex.errors import (
+            DesktopIpcUnavailable,
+            DesktopSubmissionUnknown,
+        )
+
+        # Simulate pre-fix split runtime file with a dead primary port and a live secondary port.
+        (self.data / "antigravity_runtime.json").write_text(
+            json.dumps(
+                {
+                    "ANTIGRAVITY_LS_ADDRESS": "localhost:58261",
+                    "ANTIGRAVITY_CSRF_TOKEN": "stale-csrf",
+                    "AGY_SERVER_ADDRESS": "localhost:56272",
+                    "AGY_CSRF_TOKEN": "live-csrf",
+                }
+            ),
+            encoding="utf-8",
+        )
+        fake_exe = self.home / "bin" / "agentapi.exe"
+        fake_exe.parent.mkdir(parents=True, exist_ok=True)
+        fake_exe.write_text("", encoding="utf-8")
+
+        attempted_addrs: list[str] = []
+
+        def fake_run(cmd, *, env=None, **kwargs):
+            addr = (env or {}).get("ANTIGRAVITY_LS_ADDRESS", "")
+            attempted_addrs.append(addr)
+            if addr == "localhost:58261":
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    stdout=json.dumps(
+                        {
+                            "response": {},
+                            "error": 'rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:58261: connectex: No connection could be made"',
+                        }
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"response": {"sent": True}}), stderr="")
+
+        with patch.object(agy_store, "locate_agentapi", return_value=fake_exe), \
+             patch.object(agy_store.subprocess, "run", side_effect=fake_run):
+            res = agy_store.run_agentapi("send-message", [self.thread_id, "hello"], data=self.data)
+            self.assertEqual(res, {"response": {"sent": True}})
+            self.assertEqual(attempted_addrs, ["localhost:58261", "localhost:56272"])
+
+        # Mid-flight timeout on a mutation MUST NOT retry the second candidate.
+        attempted_addrs.clear()
+
+        def fake_timeout(cmd, *, env=None, **kwargs):
+            attempted_addrs.append((env or {}).get("ANTIGRAVITY_LS_ADDRESS", ""))
+            raise subprocess.TimeoutExpired(cmd, 5)
+
+        with patch.object(agy_store, "locate_agentapi", return_value=fake_exe), \
+             patch.object(agy_store.subprocess, "run", side_effect=fake_timeout):
+            with self.assertRaises(DesktopSubmissionUnknown):
+                agy_store.run_agentapi("send-message", [self.thread_id, "hello"], data=self.data)
+            self.assertEqual(attempted_addrs, ["localhost:58261"])
+
+        # All candidates failing pre-connect raises DesktopIpcUnavailable.
+        def fake_all_refused(cmd, *, env=None, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                stdout=json.dumps({"error": "Error while dialing: connection refused"}),
+                stderr="",
+            )
+
+        with patch.object(agy_store, "locate_agentapi", return_value=fake_exe), \
+             patch.object(agy_store.subprocess, "run", side_effect=fake_all_refused):
+            with self.assertRaises(DesktopIpcUnavailable):
+                agy_store.run_agentapi("send-message", [self.thread_id, "hello"], data=self.data)
+
+    def test_desktop_follow_up_idle_fails_clearly_and_active_uses_stop_and_post_hooks(self):
+        from antigravity_telegram_bridge.codex import desktop
+        from antigravity_telegram_bridge.codex.errors import DesktopIpcUnavailable
+
+        endpoint = desktop.DesktopEndpoint(1234, desktop.ANTIGRAVITY_LOCAL_PIPE, self.home, ())
+        ctrl = desktop.DesktopControl(Mock())
+        ctrl.native.discover = Mock(return_value=endpoint)
+
+        # Idle thread in fixture: when agentapi is unavailable, fail clearly instead of silent queue.
+        with patch.object(desktop, "run_agentapi", side_effect=DesktopIpcUnavailable("dial refused")):
+            with self.assertRaises(DesktopIpcUnavailable):
+                ctrl.send_follow_up(self.thread_id, "please continue", str(self.home))
+
+        # Active thread: safely falls back to hook control queue, consumable by Stop hook as continue!
+        conn = sqlite3.connect(self.home / "conversation_summaries.db")
+        try:
+            conn.execute(
+                "UPDATE conversation_summaries SET status = 'CASCADE_RUN_STATUS_RUNNING' WHERE conversation_id = ?",
+                (self.thread_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch.object(desktop, "run_agentapi", side_effect=DesktopIpcUnavailable("dial refused")):
+            result = ctrl.send_follow_up(self.thread_id, "follow up from phone", str(self.home))
+            self.assertEqual(result["route"], "antigravity-hook-control")
+            self.assertEqual(result["mode"], "hook-control")
+
+        stop_response = agy_store.consume_pending_control(
+            self.thread_id, data=self.data, hook_event="Stop"
+        )
+        self.assertEqual(stop_response.get("decision"), "continue")
+        self.assertIn("follow up from phone", stop_response.get("reason", ""))
+
+    def test_normalize_hook_ask_question_hints_async_thread_without_name_error(self):
+        payload = {
+            "conversationId": self.thread_id,
+            "toolCall": {
+                "name": "ask_question",
+                "args": {
+                    "questions": [{"question": "Proceed?", "options": ["Yes", "No"]}],
+                },
+            },
+        }
+        with patch.object(agy_store, "data_dir", return_value=self.data):
+            normalized = agy_store.normalize_antigravity_hook_payload(payload, home=self.home)
+        self.assertEqual(normalized["tool_name"], "request_user_input")
+        db_path = self.data / "telegram_async_inputs.sqlite3"
+        self.assertTrue(db_path.is_file())
+        from contextlib import closing
+        with closing(sqlite3.connect(db_path)) as db:
+            rows = [r[0] for r in db.execute("SELECT thread FROM hints").fetchall()]
+        self.assertIn(self.thread_id, rows)
+
+    def test_quota_card_degrades_gracefully_and_monitor_records_degraded_health(self):
+        agy_store.save_runtime_env(
+            {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:59999", "ANTIGRAVITY_CSRF_TOKEN": "stale"},
+            {"modelName": "gemini-4-neon-high", "conversationId": self.thread_id},
+            data=self.data,
+        )
+        with patch.object(b, "STATE_PATH", self.data / "telegram_bot.state.json"), \
+             patch.object(b, "LOG_PATH", self.data / "telegram_bot.log"), \
+             patch.object(b, "codex_home", return_value=self.home), \
+             patch.object(agy_store, "_call_ls_rpc", return_value=None), \
+             patch.object(agy_store, "get_last_ls_error", return_value="ConnectionRefusedError (http://127.0.0.1:59999)"):
+            bot = b.TelegramCodexBot("111:fake", {"chat_id": "123"})
+            bot.send = Mock(return_value={"message_id": 42})
+            bot.edit_message = Mock(return_value={"message_id": 42})
+            bot.enqueue = Mock()
+            bot._reaction = Mock(return_value=True)
+            bot._operation_reaction = Mock(return_value=True)
+            bot._schedule_quota_monitor_poll = Mock()
+
+            bot.command_quota()
+            quota_text = bot.edit_message.call_args.args[1]
+            self.assertIn("远端窗口配额暂不可用", quota_text)
+            self.assertIn("本地会话统计", quota_text)
+            self.assertIn("gemini-4-neon-high", quota_text)
+            self.assertIn("2,500", quota_text)
+            self.assertIn("ConnectionRefusedError", quota_text)
+
+            bot._quota_monitor_poll_tick()
+            health = bot.state.snapshot().get("quota_monitor_health") or {}
+            self.assertEqual(health.get("consecutive_failures"), 1)
+            self.assertIs(health.get("ls_live_connected"), False)
+            self.assertIsNone(health.get("last_success_at"))
+            # Must not spam bogus Codex reset-card alerts.
+            bot.enqueue.assert_not_called()
+
+    def test_antigravity_sdk_runtime_new_reply_and_side_chat(self):
+        import threading
+        from antigravity_telegram_bridge.codex import antigravity_sdk as agy_sdk
+        from antigravity_telegram_bridge.codex.errors import DesktopIpcUnavailable
+
+        class FakeToolCall:
+            def __init__(self, name, args):
+                self.name = name
+                self.args = args
+
+        class FakeResponse:
+            def __init__(self, text, calls=None):
+                self._tokens = [text[:6], text[6:]]
+                self._calls = calls or []
+
+            @property
+            def tool_calls(self):
+                async def _gen():
+                    for c in self._calls:
+                        yield c
+                return _gen()
+
+            def __aiter__(self):
+                async def _gen():
+                    for tok in self._tokens:
+                        yield tok
+                return _gen()
+
+        class FakeLocalAgentConfig:
+            def __init__(self, system_instructions="", capabilities=None):
+                self.system_instructions = system_instructions
+                self.capabilities = capabilities
+
+        class FakeCapabilitiesConfig:
+            pass
+
+        created_configs = []
+
+        class FakeAgent:
+            def __init__(self, config):
+                self.config = config
+                created_configs.append(config)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def chat(self, prompt):
+                return FakeResponse(
+                    f"SDK reply to: {prompt}",
+                    calls=[FakeToolCall("run_command", {"CommandLine": "echo ok"})],
+                )
+
+        done_evt = threading.Event()
+        events = []
+
+        def on_event(ev):
+            events.append(ev)
+            if ev.get("method") == "turn/completed":
+                done_evt.set()
+
+        runtime = agy_sdk.AntigravitySdkRuntime(
+            on_event=on_event,
+            data=self.data,
+            sdk_loader=lambda: (FakeAgent, FakeLocalAgentConfig, FakeCapabilitiesConfig),
+        )
+        self.addCleanup(runtime.stop)
+
+        created = runtime.create_thread(cwd=str(self.home), model="pro", title="SDK task")
+        tid = created["id"]
+        self.assertTrue(agy_sdk.is_sdk_thread_id(tid))
+        started = runtime.start_turn(tid, "fix tests")
+        self.assertEqual(started["threadId"], tid)
+        self.assertTrue(done_evt.wait(timeout=5.0))
+
+        methods = [e.get("method") for e in events]
+        self.assertIn("turn/started", methods)
+        self.assertIn("item/completed", methods)
+        self.assertIn("turn/completed", methods)
+
+        stored = runtime.read_thread(tid, include_turns=True)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["status"]["type"], "idle")
+        agent_msgs = [
+            it["text"]
+            for it in stored["turns"][0]["items"]
+            if it.get("type") == "agentMessage"
+        ]
+        self.assertEqual(agent_msgs, ["SDK reply to: fix tests"])
+
+        # Side chat uses strictly read-only config (capabilities=None)
+        side_ans = runtime.side_chat_ask(
+            system_instructions="Read-only side chat",
+            prompt="explain architecture",
+            cwd=str(self.home),
+            timeout=10.0,
+        )
+        self.assertEqual(side_ans, "SDK reply to: explain architecture")
+        self.assertIsNone(created_configs[-1].capabilities)
+
+        # Verify CodexAppServer falls back from unavailable agentapi to SDK on /new
+        app = b.CodexAppServer(on_event, Mock())
+        app._sdk_runtime = runtime
+        with patch.object(b, "run_agentapi", side_effect=DesktopIpcUnavailable("dial refused")), \
+             patch.object(b, "sdk_available", return_value=True):
+            started_thread = app.request("thread/start", {"cwd": str(self.home)})["thread"]
+            done_evt.clear()
+            turn_res = app.request(
+                "turn/start",
+                {"threadId": started_thread["id"], "input": [{"type": "text", "text": "hello sdk"}]},
+            )
+            self.assertTrue(agy_sdk.is_sdk_thread_id(turn_res["threadId"]))
+            self.assertTrue(done_evt.wait(timeout=5.0))
+
+    def test_side_chat_in_antigravity_mode_reports_clear_sdk_requirement(self):
+        from antigravity_telegram_bridge.codex import antigravity_sdk as agy_sdk
+        from antigravity_telegram_bridge.features.side_chat import SideChats
+
+        with patch.object(b, "STATE_PATH", self.data / "telegram_bot.state.json"), \
+             patch.object(b, "codex_home", return_value=self.home), \
+             patch.object(agy_sdk, "sdk_available", return_value=False):
+            bot = b.TelegramCodexBot("111:fake", {"chat_id": "123"})
+            bot.send = Mock(return_value={"message_id": 50})
+            bot._reaction = Mock(return_value=True)
+            sides = SideChats(bot, b.CodexAppServer, database=self.data / "side.sqlite3")
+            sides._run({"kind": "parent", "target": self.thread_id, "parent": self.thread_id}, "what changed?", 99)
+            self.assertTrue(bot.send.called)
+            msg = bot.send.call_args.args[0]
+            self.assertIn("google-antigravity", msg)
+
+    def test_sidecar_install_creates_manifest_and_uninstall_cleans_up(self):
+        from antigravity_telegram_bridge.management import install as mgmt_install
+
+        sc_file = self.home / "sidecars" / "antigravity-telegram-bridge" / "sidecar.json"
+        with patch.object(mgmt_install, "codex_home", return_value=self.home), \
+             patch.object(mgmt_install, "ensure_data_dir", return_value=self.data), \
+             patch.object(mgmt_install, "hooks_json_path", return_value=self.home / "agy-hooks.json"), \
+             patch.object(mgmt_install, "sidecar_json_path", return_value=sc_file), \
+             patch("antigravity_telegram_bridge.codex.desktop.discover_desktop"), \
+             patch.object(mgmt_install.services, "snapshot", return_value={"content": None}), \
+             patch.object(mgmt_install.services, "manage") as mock_svc:
+            rc = mgmt_install.install(service=True, sidecar=True)
+            self.assertEqual(rc, 0)
+            self.assertTrue(sc_file.is_file())
+            manifest = json.loads(sc_file.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["restart_policy"], "always")
+            self.assertEqual(manifest["display_name"], "Antigravity Telegram Bridge")
+            self.assertIn("run", manifest["args"])
+            self.assertIn("--quiet-start", manifest["args"])
+            self.assertFalse(manifest["has_web_ui"])
+            # Sidecar install must not install an OS scheduled task.
+            mock_svc.assert_not_called()
+
+            rc_un = mgmt_install.uninstall()
+            self.assertEqual(rc_un, 0)
+            self.assertFalse(sc_file.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

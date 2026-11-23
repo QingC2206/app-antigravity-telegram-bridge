@@ -24,12 +24,14 @@ def question_id(item_id: str, index: int) -> str:
 
 
 def hint_async_thread(thread_id: str, directory: Path) -> None:
+    from contextlib import closing
     import re
     if not re.fullmatch(r'[A-Za-z0-9-]{6,64}', thread_id):
         return
-    with sqlite3.connect(directory / 'telegram_async_inputs.sqlite3', timeout=2) as db:
-        db.execute('CREATE TABLE IF NOT EXISTS hints(thread TEXT PRIMARY KEY,updated REAL)')
-        db.execute('INSERT OR REPLACE INTO hints VALUES(?,?)', (thread_id, time.time()))
+    with closing(sqlite3.connect(directory / 'telegram_async_inputs.sqlite3', timeout=2)) as db:
+        with db:
+            db.execute('CREATE TABLE IF NOT EXISTS hints(thread TEXT PRIMARY KEY,updated REAL)')
+            db.execute('INSERT OR REPLACE INTO hints VALUES(?,?)', (thread_id, time.time()))
 
 
 class AsyncInputs:

@@ -21,8 +21,9 @@ def main(argv=None):
     doctor = commands.add_parser('doctor', help='read-only checks; never submits a task message')
     doctor.add_argument('--json', action='store_true')
     doctor.add_argument('--offline', action='store_true', help='only check local installation')
-    install = commands.add_parser('install', help='register Codex hooks and the user service')
+    install = commands.add_parser('install', help='register Codex/Antigravity hooks and the user service or sidecar')
     install.add_argument('--no-service', action='store_true')
+    install.add_argument('--sidecar', action='store_true', help='register as a native Antigravity Sidecar instead of an OS service')
     install.add_argument('--replace-notify', action='store_true', help='explicitly replace another notify command')
     commands.add_parser('uninstall', help='remove owned hooks/service, keeping credentials and messages')
     service = commands.add_parser('service')
@@ -107,7 +108,10 @@ def main(argv=None):
         return doctor(offline=args.offline, as_json=args.json)
     if args.command == 'install':
         from .management.install import install
-        return install(service=not args.no_service, replace_notify=args.replace_notify)
+        kwargs = {'service': not args.no_service, 'replace_notify': args.replace_notify}
+        if args.sidecar:
+            kwargs['sidecar'] = True
+        return install(**kwargs)
 
 
 if __name__ == '__main__':

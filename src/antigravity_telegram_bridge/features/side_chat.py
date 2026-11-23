@@ -154,6 +154,72 @@ class SideChats:
         try:
             self.bot._require_task_actions()
             if not self.bot._reaction('🤔'):self.bot.send(_t('💬 侧边聊天正在回答，主任务继续运行。'),reply_to=source)
+            from ..core.bot import CodexAppServer
+            use_agy = (
+                isinstance(self.app, CodexAppServer)
+                and self.app.process is None
+                and self.app.argv is None
+                and not self.app.runtime
+                and isinstance(getattr(self.bot, 'app', None), CodexAppServer)
+                and self.bot.app._use_antigravity_store() is True
+            )
+            if use_agy:
+                from ..codex.antigravity_sdk import is_sdk_thread_id, sdk_available, _summarize_prior_turns
+                from ..codex.antigravity_store import build_thread_from_antigravity
+                if not sdk_available():
+                    raise RuntimeError(
+                        _t('Antigravity 模式下的侧边聊天需要安装官方 Python SDK（`pip install google-antigravity`）。原主任务不受影响。')
+                    )
+                sdk = self.bot.app._get_sdk_runtime()
+                parent_thread = (
+                    sdk.read_thread(parent, include_turns=True)
+                    if is_sdk_thread_id(parent)
+                    else build_thread_from_antigravity(parent, include_turns=True)
+                ) or {}
+                parent_cwd = str(parent_thread.get('cwd') or '')
+                prior_summary = _summarize_prior_turns(parent_thread.get('turns') or [], max_turns=6)
+                instructions = SIDE_INSTRUCTIONS
+                if prior_summary:
+                    instructions = f"{SIDE_INSTRUCTIONS}\n\n{prior_summary}\n\n{BOUNDARY}"
+                text = sdk.side_chat_ask(
+                    system_instructions=instructions,
+                    prompt=question,
+                    cwd=parent_cwd,
+                    timeout=300.0,
+                )
+                if not text.strip():
+                    raise ValueError(_t('侧边会话没有返回答复。'))
+                title = n.conversation_title(parent)
+                import re
+                title = re.sub(r'([\\`*_{}\[\]()<>#+.!|~-])', r'\\\1', title)
+                pages = n.split_markdown_pages(text, limit=2800)
+                side_id = f'side-{parent[:8]}'
+                deliveries = []
+                pending_delivery = False
+                for index, page in enumerate(pages, 1):
+                    if self.bot._background_allowed(generation) is False:
+                        return
+                    sent = self.bot.send(
+                        _t('**💬 侧边聊天 · {p0}**\n\n主任务：`{p1}` · 侧边：`{p2}` · {p3}/{p4}\n\n', p0=format(title, ''), p1=format(parent[:8], ''), p2=format(side_id[:8], ''), p3=format(index, ''), p4=format(len(pages), '')) + page,
+                        {'inline_keyboard': [[{'text': _t('新建侧边聊天'), 'callback_data': 'side|' + parent}]]},
+                        reply_to=source,
+                    )
+                    if isinstance(sent, dict) and sent.get('_pending_outbox'):
+                        pending_delivery = True
+                        deliveries.append(sent['_pending_outbox'])
+                        self.bot.delivery.after_delivery(
+                            sent['_pending_outbox'], 'side',
+                            {'kind': 'parent', 'target': parent, 'parent': parent},
+                        )
+                    else:
+                        self.remember(sent.get('message_id'), 'parent', parent, parent)
+                        if isinstance(sent, dict) and sent.get('_outbox_id'):
+                            deliveries.append(sent['_outbox_id'])
+                if pending_delivery:
+                    self.bot.delivery.defer_reaction(deliveries, source, generation)
+                else:
+                    self.bot._reaction('🎉')
+                return
             if not tid:
                 response=self.app.request('thread/fork',{'threadId':parent,'ephemeral':True,'excludeTurns':True,
                     'sandbox':'read-only','approvalPolicy':'never','developerInstructions':SIDE_INSTRUCTIONS},timeout=45)

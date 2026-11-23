@@ -514,12 +514,25 @@ class DesktopControl:
             if expected_turn_id and current_turn and expected_turn_id != current_turn:
                 raise DesktopIpcInactive(_t('原 Turn 已结束或发生变化，未发送消息。'))
             target_turn = expected_turn_id or (current_turn if active else "")
-            runtime = load_runtime_env()
-            if locate_agentapi(endpoint.profile) is not None and runtime.get("ANTIGRAVITY_LS_ADDRESS"):
+            try:
                 run_agentapi("send-message", [thread_id, text], cwd=cwd, home=endpoint.profile, timeout=self.timeout)
                 return {"ok": True, "mode": "native", "route": "antigravity-agentapi", "turn_id": target_turn}
-            queue_pending_control(thread_id, inject_message=text)
-            return {"ok": True, "mode": "native", "route": "antigravity-hook-control", "turn_id": target_turn}
+            except DesktopIpcUnavailable as exc:
+                if active:
+                    queue_pending_control(thread_id, inject_message=text)
+                    return {
+                        "ok": True,
+                        "mode": "hook-control",
+                        "route": "antigravity-hook-control",
+                        "turn_id": target_turn,
+                        "fallback_reason": str(exc),
+                    }
+                raise DesktopIpcUnavailable(
+                    _t(
+                        '无法向空闲的 Antigravity 桌面会话投递消息：{p0}。当前会话未在运行，无法通过 Hook 注入队列唤醒；请确认 Antigravity 连接可用，或发送 `/new` 创建新任务。',
+                        p0=str(exc).rstrip('。.'),
+                    )
+                ) from exc
 
         owner = self._legacy_for_current_desktop(thread_id, endpoint=endpoint)
         reader = self._reader(endpoint)

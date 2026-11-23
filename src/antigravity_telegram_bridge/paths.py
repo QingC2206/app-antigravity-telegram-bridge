@@ -33,6 +33,10 @@ def hooks_json_path() -> Path:
     return antigravity_config_dir() / 'hooks.json'
 
 
+def sidecar_json_path(sidecar_id: str = 'antigravity-telegram-bridge') -> Path:
+    return antigravity_config_dir() / 'sidecars' / sidecar_id / 'sidecar.json'
+
+
 def data_dir() -> Path:
     explicit = (
         os.environ.get('ANTIGRAVITY_TELEGRAM_DATA_DIR', '').strip()

@@ -118,7 +118,10 @@ def check_connection(*, thread_id: str = "", send_probe: bool = False,
             report["desktop_attempts"] = 1
             result = client.send_follow_up(thread_id, prompt, "", start_if_inactive=False,
                                            expected_turn_id=target_turn, recover_owner=True)
-            if not isinstance(result, dict) or result.get("route") != "desktop-user-input" or not result.get('turn_id'):
+            valid_routes = {"desktop-user-input"}
+            if endpoint.pipe == desktop.ANTIGRAVITY_LOCAL_PIPE:
+                valid_routes.add("antigravity-agentapi")
+            if not isinstance(result, dict) or result.get("route") not in valid_routes or not result.get('turn_id'):
                 raise RuntimeError("消息提交未确认使用 Desktop 用户输入通道；不会重发。")
             report['desktop_route'] = result['route']
             deadline = time.monotonic() + receipt_timeout

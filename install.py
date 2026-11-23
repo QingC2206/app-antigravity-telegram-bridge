@@ -21,6 +21,7 @@ def main():
     )
     parser.add_argument('--data-dir', type=Path)
     parser.add_argument('--no-service', action='store_true')
+    parser.add_argument('--sidecar', action='store_true', help='register as a native Antigravity Sidecar (recommended for live LS/agentapi access)')
     parser.add_argument('--replace-notify', action='store_true')
     parser.add_argument('--skip-setup', action='store_true')
     parser.add_argument('--language', choices=['zh-CN', 'zh', 'en'], help='initial UI language; omitted preserves the existing choice (Chinese by default)')
@@ -54,7 +55,7 @@ def main():
             subprocess.run([*command, 'service', 'start'], env=env)
         raise
     def finish(code):
-        if stopped and (code or args.no_service):
+        if stopped and (code or (args.no_service and not args.sidecar)):
             subprocess.run([*command, 'service', 'start'], env=env)
         return code
     if args.language:
@@ -70,7 +71,11 @@ def main():
         result = subprocess.run([*command, 'setup'], env=env)
         if result.returncode not in (0,2):
             return finish(result.returncode)
-    options = (['--no-service'] if args.no_service else []) + (['--replace-notify'] if args.replace_notify else [])
+    options = (
+        (['--no-service'] if args.no_service else [])
+        + (['--sidecar'] if args.sidecar else [])
+        + (['--replace-notify'] if args.replace_notify else [])
+    )
     return finish(subprocess.call([*command, 'install', *options], env=env))
 
 

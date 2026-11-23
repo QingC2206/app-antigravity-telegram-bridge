@@ -2273,7 +2273,17 @@ def send_hook_notification(payload: dict[str, Any]) -> int:
         if is_antigravity:
             if hook_event == "PreToolUse":
                 print(json.dumps({"decision": "allow"}))
-            elif hook_event in {"Stop", "SubagentStop"}:
+            elif hook_event == "Stop":
+                stop_ctrl: dict[str, Any] = {}
+                try:
+                    stop_ctrl = consume_pending_control(
+                        str(payload.get("conversationId") or payload.get("thread_id") or ""),
+                        hook_event="Stop",
+                    )
+                except Exception:
+                    stop_ctrl = {}
+                print(json.dumps(stop_ctrl if stop_ctrl else {"decision": "stop"}, ensure_ascii=False))
+            elif hook_event == "SubagentStop":
                 print(json.dumps({"decision": "stop"}))
 
 
