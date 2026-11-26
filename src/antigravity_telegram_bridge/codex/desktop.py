@@ -22,6 +22,7 @@ from .errors import *
 from .antigravity_store import (
     build_thread_from_antigravity,
     cancel_antigravity_cascade,
+    drop_pending_display_message,
     has_antigravity_data,
     list_antigravity_threads,
     load_runtime_env,
@@ -540,10 +541,14 @@ class DesktopControl:
             if expected_turn_id and current_turn and expected_turn_id != current_turn:
                 raise DesktopIpcInactive(_t('原 Turn 已结束或发生变化，未发送消息。'))
             target_turn = expected_turn_id or (current_turn if active else "")
+            # Queue inline UI display echo before waking the conversation so
+            # PreInvocation never races ahead of run_agentapi returning.
+            queue_pending_control(thread_id, display_message=text)
             try:
                 run_agentapi("send-message", [thread_id, text], cwd=cwd, home=endpoint.profile, timeout=self.timeout)
                 return {"ok": True, "mode": "native", "route": "antigravity-agentapi", "turn_id": target_turn}
             except DesktopIpcUnavailable as exc:
+                drop_pending_display_message(thread_id, text)
                 if active:
                     queue_pending_control(thread_id, inject_message=text)
                     return {

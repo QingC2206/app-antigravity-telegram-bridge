@@ -2195,8 +2195,18 @@ def send_hook_notification(payload: dict[str, Any]) -> int:
             normalize_antigravity_hook_payload,
             save_runtime_env,
         )
+        raw_evt = str(payload.get('hookEventName') or payload.get('hook_event_name') or '').strip()
+        conv_id = str(payload.get('conversationId') or payload.get('thread_id') or '').strip()
+        if raw_evt == 'PreInvocation':
+            ctrl = consume_pending_control(conv_id, hook_event='PreInvocation')
+            print(json.dumps(ctrl, ensure_ascii=False) if ctrl else '{}')
+            return 0
         save_runtime_env(os.environ, payload)
         payload = normalize_antigravity_hook_payload(payload, home=SOURCE_STATE_ROOT)
+        if payload.get('hook_event_name') == 'PreInvocation':
+            ctrl = consume_pending_control(str(payload.get('conversationId') or payload.get('thread_id') or ''), hook_event='PreInvocation')
+            print(json.dumps(ctrl, ensure_ascii=False) if ctrl else '{}')
+            return 0
         if payload.get('hook_event_name') == 'PostInvocation':
             ctrl = consume_pending_control(str(payload.get('conversationId') or payload.get('thread_id') or ''))
             print(json.dumps(ctrl, ensure_ascii=False) if ctrl else '{}')

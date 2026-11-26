@@ -147,6 +147,7 @@ def install(*, service=True, replace_notify=False, sidecar=False):
             agy_hooks['antigravity-telegram-bridge']={
                 'enabled': True,
                 'SessionStart': [cmd_entry],
+                'PreInvocation': [cmd_entry],
                 'PreToolUse': [{'matcher':'ask_question','hooks':[cmd_entry]}],
                 'PostInvocation': [cmd_entry],
                 'Stop': [cmd_entry],

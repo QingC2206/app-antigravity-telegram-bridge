@@ -73,6 +73,7 @@ def registration_plan(remove=False):
                 agy_hooks['antigravity-telegram-bridge'] = {
                     'enabled': True,
                     'SessionStart': [cmd_entry],
+                    'PreInvocation': [cmd_entry],
                     'PreToolUse': [{'matcher': 'ask_question', 'hooks': [cmd_entry]}],
                     'PostInvocation': [cmd_entry],
                     'Stop': [cmd_entry],
@@ -148,9 +149,19 @@ def main(arguments=None):
         raw = arguments[-1] if arguments else sys.stdin.read(2*1024*1024)
         payload = json.loads(raw)
         if isinstance(payload, dict) and 'conversationId' in payload:
+            raw_evt = str(payload.get('hookEventName') or payload.get('hook_event_name') or '').strip()
+            conv_id = str(payload.get('conversationId') or payload.get('thread_id') or '').strip()
+            if raw_evt == 'PreInvocation':
+                ctrl = consume_pending_control(conv_id, hook_event='PreInvocation')
+                print(json.dumps(ctrl, ensure_ascii=False) if ctrl else '{}')
+                return 0
             save_runtime_env(os.environ, payload)
             payload = normalize_antigravity_hook_payload(payload)
             hook_evt = payload.get('hook_event_name')
+            if hook_evt == 'PreInvocation':
+                ctrl = consume_pending_control(str(payload.get('conversationId') or payload.get('thread_id') or ''), hook_event='PreInvocation')
+                print(json.dumps(ctrl, ensure_ascii=False) if ctrl else '{}')
+                return 0
             if hook_evt == 'PostInvocation':
                 ctrl = consume_pending_control(str(payload.get('conversationId') or payload.get('thread_id') or ''))
                 if ctrl:

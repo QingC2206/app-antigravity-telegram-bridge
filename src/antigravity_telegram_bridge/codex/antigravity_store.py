@@ -1506,38 +1506,8 @@ def _control_queue_path(data: Path | None = None) -> Path:
     return (data or ensure_data_dir()) / "antigravity_control.json"
 
 
-def queue_pending_control(
-    thread_id: str,
-    *,
-    stop: bool = False,
-    inject_message: str | None = None,
-    data: Path | None = None,
-) -> None:
-    if not thread_id:
-        return
-    path = _control_queue_path(data)
+def _write_control_records(path: Path, records: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    records: dict[str, Any] = {}
-    if path.is_file():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                records = loaded
-        except (OSError, ValueError):
-            records = {}
-    entry = records.get(thread_id)
-    if not isinstance(entry, dict):
-        entry = {"stop": False, "messages": [], "updated_at": time.time()}
-    if stop:
-        entry["stop"] = True
-    if inject_message and inject_message.strip():
-        msgs = entry.get("messages")
-        if not isinstance(msgs, list):
-            msgs = []
-        msgs.append(inject_message.strip())
-        entry["messages"] = msgs
-    entry["updated_at"] = time.time()
-    records[thread_id] = entry
     tmp = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -1553,6 +1523,125 @@ def queue_pending_control(
     finally:
         if tmp is not None:
             tmp.unlink(missing_ok=True)
+
+
+_QUESTION_REPLY_BLOCK_RE = re.compile(
+    r"^\s*<send_user_message_question_reply>\s*([\s\S]*?)\s*</send_user_message_question_reply>\s*$"
+)
+
+
+def format_telegram_user_markdown(text: str) -> str:
+    """Format a Telegram message for inline UI rendering via PreInvocation metadata.user_markdown."""
+    body = str(text or "").strip()
+    if not body:
+        return ""
+    match = _QUESTION_REPLY_BLOCK_RE.match(body)
+    if match:
+        try:
+            items = json.loads(match.group(1))
+        except ValueError:
+            items = None
+        if isinstance(items, list) and items:
+            lines: list[str] = []
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                q = str(entry.get("question") or "").strip()
+                a = str(entry.get("answer") or "").strip()
+                if q and a:
+                    lines.append(f"- **{q}**: {a}")
+                elif a:
+                    lines.append(f"- {a}")
+            if lines:
+                return "**📱 Telegram**\n\n" + "\n".join(lines)
+    return f"**📱 Telegram**\n\n{body}"
+
+
+def queue_pending_control(
+    thread_id: str,
+    *,
+    stop: bool = False,
+    inject_message: str | None = None,
+    display_message: str | None = None,
+    data: Path | None = None,
+) -> None:
+    if not thread_id:
+        return
+    path = _control_queue_path(data)
+    records: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                records = loaded
+        except (OSError, ValueError):
+            records = {}
+    entry = records.get(thread_id)
+    if not isinstance(entry, dict):
+        entry = {"stop": False, "messages": [], "display_messages": [], "updated_at": time.time()}
+    if stop:
+        entry["stop"] = True
+    if inject_message and inject_message.strip():
+        msgs = entry.get("messages")
+        if not isinstance(msgs, list):
+            msgs = []
+        msgs.append(inject_message.strip())
+        entry["messages"] = msgs[-20:]
+    if display_message and display_message.strip():
+        dmsgs = entry.get("display_messages")
+        if not isinstance(dmsgs, list):
+            dmsgs = []
+        dmsgs.append(display_message.strip())
+        entry["display_messages"] = dmsgs[-20:]
+    entry["updated_at"] = time.time()
+    records[thread_id] = entry
+    _write_control_records(path, records)
+
+
+def drop_pending_display_message(
+    thread_id: str,
+    display_message: str,
+    *,
+    data: Path | None = None,
+) -> None:
+    """Roll back a pre-queued display echo when agentapi send-message failed before connect."""
+    target = str(display_message or "").strip()
+    if not thread_id or not target:
+        return
+    path = _control_queue_path(data)
+    if not path.is_file():
+        return
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(records, dict) or thread_id not in records:
+        return
+    entry = records.get(thread_id)
+    if not isinstance(entry, dict):
+        return
+    dmsgs = entry.get("display_messages")
+    if not isinstance(dmsgs, list) or not dmsgs:
+        return
+    removed = False
+    for idx in range(len(dmsgs) - 1, -1, -1):
+        if str(dmsgs[idx]).strip() == target:
+            dmsgs.pop(idx)
+            removed = True
+            break
+    if not removed:
+        return
+    entry["display_messages"] = dmsgs
+    stop_flag = bool(entry.get("stop"))
+    msgs = [m for m in (entry.get("messages") or []) if str(m).strip()] if isinstance(entry.get("messages"), list) else []
+    if not stop_flag and not msgs and not dmsgs:
+        records.pop(thread_id, None)
+    else:
+        records[thread_id] = entry
+    try:
+        _write_control_records(path, records)
+    except OSError:
+        pass
 
 
 def consume_pending_control(
@@ -1572,51 +1661,75 @@ def consume_pending_control(
         return {}
     if not isinstance(records, dict) or thread_id not in records:
         return {}
-    entry = records.pop(thread_id, None)
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=".agy-ctrl-",
-            delete=False,
-        ) as handle:
-            tmp = Path(handle.name)
-            json.dump(records, handle, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except OSError:
-        pass
-    finally:
-        if tmp is not None:
-            tmp.unlink(missing_ok=True)
-    if not isinstance(entry, dict):
+    entry = records.get(thread_id)
+    if not isinstance(entry, dict) or time.time() - float(entry.get("updated_at") or 0) > 3600:
+        records.pop(thread_id, None)
+        try:
+            _write_control_records(path, records)
+        except OSError:
+            pass
         return {}
-    if time.time() - float(entry.get("updated_at") or 0) > 3600:
+
+    stop_flag = bool(entry.get("stop"))
+    raw_msgs = entry.get("messages")
+    clean_msgs = [str(m) for m in raw_msgs if str(m).strip()] if isinstance(raw_msgs, list) else []
+    raw_display = entry.get("display_messages")
+    clean_display = [str(m) for m in raw_display if str(m).strip()] if isinstance(raw_display, list) else []
+
+    def _save_remaining(*, keep_stop: bool, keep_msgs: list[str], keep_display: list[str]) -> None:
+        if not keep_stop and not keep_msgs and not keep_display:
+            records.pop(thread_id, None)
+        else:
+            records[thread_id] = {
+                "stop": keep_stop,
+                "messages": keep_msgs,
+                "display_messages": keep_display,
+                "updated_at": entry.get("updated_at", time.time()),
+            }
+        try:
+            _write_control_records(path, records)
+        except OSError:
+            pass
+
+    if hook_event == "PreInvocation":
+        if not clean_display:
+            return {}
+        _save_remaining(keep_stop=stop_flag, keep_msgs=clean_msgs, keep_display=[])
+        steps = []
+        for msg in clean_display:
+            rendered = format_telegram_user_markdown(msg)
+            if rendered:
+                steps.append(
+                    {
+                        "systemMessage": {
+                            "systemMessage": "",
+                            "metadata": {"user_markdown": rendered},
+                        }
+                    }
+                )
+        return {"injectSteps": steps} if steps else {}
+
+    if not stop_flag and not clean_msgs:
         return {}
+
+    _save_remaining(keep_stop=False, keep_msgs=[], keep_display=clean_display)
     if hook_event == "Stop":
-        if entry.get("stop"):
+        if stop_flag:
             return {"decision": "stop"}
-        msgs = entry.get("messages")
-        if isinstance(msgs, list) and msgs:
-            clean_msgs = [str(m) for m in msgs if str(m).strip()]
-            if clean_msgs:
-                return {
-                    "decision": "continue",
-                    "reason": "User follow-up from Telegram:\n" + "\n\n".join(clean_msgs),
-                }
+        if clean_msgs:
+            return {
+                "decision": "continue",
+                "reason": "User follow-up from Telegram:\n" + "\n\n".join(clean_msgs),
+            }
         return {}
     response: dict[str, Any] = {}
-    if entry.get("stop"):
+    if stop_flag:
         response["terminationBehavior"] = "terminate"
         return response
-    msgs = entry.get("messages")
-    if isinstance(msgs, list) and msgs:
-        clean_msgs = [str(m) for m in msgs if str(m).strip()]
-        if clean_msgs:
-            response["injectSteps"] = [{"userMessage": m} for m in clean_msgs]
-            response["terminationBehavior"] = "force_continue"
-            response["additionalContext"] = "\n\n".join(clean_msgs)
+    if clean_msgs:
+        response["injectSteps"] = [{"userMessage": m} for m in clean_msgs]
+        response["terminationBehavior"] = "force_continue"
+        response["additionalContext"] = "\n\n".join(clean_msgs)
     return response
 
 

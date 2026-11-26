@@ -39,6 +39,7 @@ from antigravity_telegram_bridge.codex.antigravity_store import (
     build_thread_from_antigravity,
     cancel_antigravity_cascade,
     compute_antigravity_token_usage,
+    drop_pending_display_message,
     fetch_antigravity_account,
     fetch_antigravity_models,
     has_antigravity_data,
@@ -456,9 +457,11 @@ class CodexAppServer:
                     cwd=str(params.get("cwd") or ""),
                     model=str(params.get("model") or ""),
                 )
+            queue_pending_control(tid, display_message=text)
             try:
                 run_agentapi("send-message", [tid, text], cwd=str(params.get("cwd") or ""), timeout=timeout)
             except DesktopIpcUnavailable as exc:
+                drop_pending_display_message(tid, text)
                 summary = read_conversation_summary(tid) or {}
                 if (summary.get("status") or {}).get("type") == "active":
                     queue_pending_control(tid, inject_message=text)

@@ -285,9 +285,10 @@ class AntigravityStoreAndArtifactsTests(unittest.TestCase):
         self.assertIn("user-plugin", registered)
         self.assertIn("antigravity-telegram-bridge", registered)
         bridge_hooks = registered["antigravity-telegram-bridge"]
-        for event in ("SessionStart", "PreToolUse", "PostInvocation", "Stop"):
+        for event in ("SessionStart", "PreInvocation", "PreToolUse", "PostInvocation", "Stop"):
             self.assertIn(event, bridge_hooks)
         self.assertEqual(bridge_hooks["SessionStart"][0]["type"], "command")
+        self.assertEqual(bridge_hooks["PreInvocation"][0]["type"], "command")
         self.assertEqual(bridge_hooks["PreToolUse"][0]["matcher"], "ask_question")
         self.assertEqual(bridge_hooks["PreToolUse"][0]["hooks"][0]["type"], "command")
         self.assertEqual(bridge_hooks["PostInvocation"][0]["type"], "command")
@@ -949,6 +950,80 @@ class AntigravityStoreAndArtifactsTests(unittest.TestCase):
         )
         self.assertEqual(normalized["turn_id"], "turn-4")
         self.assertEqual(normalized["last_assistant_message"], "已提交并推送完成。")
+
+    def test_pre_invocation_injects_user_markdown_without_clobbering_other_controls(self):
+        from antigravity_telegram_bridge.codex import desktop
+        from antigravity_telegram_bridge.codex.errors import DesktopIpcUnavailable
+        from antigravity_telegram_bridge.telegram import notifications as notify
+
+        # 1. Queue both a PreInvocation display echo and a PostInvocation inject_message on the same thread.
+        agy_store.queue_pending_control(
+            self.thread_id,
+            inject_message="post-hook follow up",
+            display_message="提交并推送",
+            data=self.data,
+        )
+        # PreInvocation pops ONLY display_messages and outputs official user_markdown with empty model systemMessage.
+        pre_payload = {"conversationId": self.thread_id, "hookEventName": "PreInvocation", "invocationNum": 1}
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            rc = notify.send_hook_notification(pre_payload)
+        self.assertEqual(rc, 0)
+        pre_resp = json.loads(out.getvalue().strip())
+        self.assertEqual(
+            pre_resp,
+            {
+                "injectSteps": [
+                    {
+                        "systemMessage": {
+                            "systemMessage": "",
+                            "metadata": {"user_markdown": "**📱 Telegram**\n\n提交并推送"},
+                        }
+                    }
+                ]
+            },
+        )
+        # Second PreInvocation returns {} cleanly (consumed once).
+        out2 = io.StringIO()
+        with patch("sys.stdout", out2):
+            notify.send_hook_notification(pre_payload)
+        self.assertEqual(json.loads(out2.getvalue().strip()), {})
+
+        # PostInvocation message was NOT clobbered by PreInvocation.
+        post_resp = agy_store.consume_pending_control(self.thread_id, data=self.data, hook_event="PostInvocation")
+        self.assertEqual(post_resp.get("injectSteps"), [{"userMessage": "post-hook follow up"}])
+
+        # 2. Desktop send_follow_up queues display_message on success and rolls it back on pre-connect failure.
+        endpoint = desktop.DesktopEndpoint(1234, desktop.ANTIGRAVITY_LOCAL_PIPE, self.home, ())
+        ctrl = desktop.DesktopControl(Mock())
+        ctrl.native.discover = Mock(return_value=endpoint)
+        with patch.object(desktop, "run_agentapi", return_value={"response": {"sendMessage": {}}}):
+            ctrl.send_follow_up(self.thread_id, "核实状态", str(self.home))
+        echo = agy_store.consume_pending_control(self.thread_id, data=self.data, hook_event="PreInvocation")
+        self.assertEqual(
+            echo["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"],
+            "**📱 Telegram**\n\n核实状态",
+        )
+
+        with patch.object(desktop, "run_agentapi", side_effect=DesktopIpcUnavailable("dial refused")):
+            with self.assertRaises(DesktopIpcUnavailable):
+                ctrl.send_follow_up(self.thread_id, "发送失败的消息", str(self.home))
+        # Failed pre-connect delivery must not leave a phantom display echo.
+        self.assertEqual(
+            agy_store.consume_pending_control(self.thread_id, data=self.data, hook_event="PreInvocation"),
+            {},
+        )
+
+        # 3. Async question reply envelope formats cleanly instead of raw XML/JSON.
+        reply_xml = (
+            "<send_user_message_question_reply>\n"
+            + json.dumps([{"question": "是否推送？", "answer": "立即推送"}], ensure_ascii=False)
+            + "\n</send_user_message_question_reply>"
+        )
+        self.assertEqual(
+            agy_store.format_telegram_user_markdown(reply_xml),
+            "**📱 Telegram**\n\n- **是否推送？**: 立即推送",
+        )
 
 
 if __name__ == "__main__":
