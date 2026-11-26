@@ -60,8 +60,16 @@ def _process_environment(pid: int) -> dict[str, str]:
         parameters = pointer(int(info.peb) + 0x20)
         environment = pointer(parameters + 0x80)
         raw = bytearray()
-        for _ in range(256):
-            chunk = read(environment + len(raw), 1024)
+        max_bytes = 256 * 1024
+        while len(raw) < max_bytes:
+            address = environment + len(raw)
+            # Stay within one 4 KiB virtual memory page per ReadProcessMemory call
+            # so a block ending near a page boundary never triggers ERROR_PARTIAL_COPY.
+            page_remaining = 4096 - (address % 4096)
+            chunk_size = min(1024, page_remaining, max_bytes - len(raw))
+            if chunk_size <= 0 or chunk_size % 2:
+                break
+            chunk = read(address, chunk_size)
             if not chunk or len(chunk) % 2:
                 break
             raw.extend(chunk)
@@ -97,6 +105,24 @@ def validate_pipe_server(handle: int, expected_pid: int) -> None:
         raise DesktopBridgeSafetyError(_t('Desktop 连接进程已改变或不属于当前环境，未提交消息。'))
 
 
+def _is_electron_node_helper(cmdline: list[str] | tuple[str, ...] | None) -> bool:
+    """Detect Electron processes launched as Node helpers/sidecars (ELECTRON_RUN_AS_NODE)."""
+    if not cmdline or len(cmdline) < 2:
+        return False
+    node_flags = ("--import", "--loader", "--require", "-r", "-e", "--eval", "-p", "--print")
+    node_prefixes = ("--import=", "--loader=", "--require=", "--eval=", "--experimental-")
+    for raw_arg in cmdline[1:]:
+        arg = str(raw_arg or "").strip()
+        if not arg:
+            continue
+        lower = arg.lower()
+        if lower in node_flags or lower.startswith(node_prefixes):
+            return True
+        if not arg.startswith("-") and lower.endswith((".js", ".mjs", ".cjs")):
+            return True
+    return False
+
+
 def desktop_roots():
     import psutil
     records = []
@@ -112,6 +138,11 @@ def desktop_roots():
             and path.parent.parent.parent.name.lower() == 'windowsapps'
         )
         is_antigravity = path.name.lower() == 'antigravity.exe'
-        if (is_codex_store or is_antigravity) and not any(arg.startswith('--type=') for arg in (info['cmdline'] or [])):
+        cmdline = info['cmdline'] or []
+        if any(str(arg).startswith('--type=') for arg in cmdline):
+            continue
+        if is_antigravity and _is_electron_node_helper(cmdline):
+            continue
+        if is_codex_store or is_antigravity:
             records.append({'ProcessId': info['pid'], 'ExecutablePath': str(path)})
     return records

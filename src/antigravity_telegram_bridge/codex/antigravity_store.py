@@ -163,6 +163,40 @@ def clean_user_input_text(raw: Any) -> str:
     return text.strip()
 
 
+_AGY_MESSAGE_BLOCK_RE = re.compile(r"(?:^|\r?\n)<SYSTEM_MESSAGE>\r?\n([\s\S]*)</SYSTEM_MESSAGE>\s*$")
+_AGY_MESSAGE_HEADER_RE = re.compile(r"^\[Message\]\s+([^\n]*?)\bcontent=([\s\S]+)$")
+_AGY_TASK_SENDER_RE = re.compile(r"\bsender=[^\s]*/task-[^\s]+")
+
+
+def extract_antigravity_message_input(step: Mapping[str, Any]) -> str:
+    """Extract user/external message text delivered via `agentapi send-message`.
+
+    Antigravity persists `agentapi send-message` deliveries as `SYSTEM_MESSAGE`
+    steps containing `<SYSTEM_MESSAGE>\\n[Message] ... content=<text>\\n</SYSTEM_MESSAGE>`.
+    Internal background-task completion notifications (`sender=<id>/task-...`)
+    and non-message system reminders are excluded.
+    """
+    if not isinstance(step, Mapping) or step.get("type") != "SYSTEM_MESSAGE":
+        return ""
+    raw = str(step.get("content") or "")
+    if "[Message]" not in raw:
+        return ""
+    block_match = _AGY_MESSAGE_BLOCK_RE.search(raw)
+    body = (block_match.group(1) if block_match else raw).strip()
+    header_match = _AGY_MESSAGE_HEADER_RE.match(body)
+    if not header_match:
+        return ""
+    meta = header_match.group(1)
+    content = header_match.group(2).strip()
+    if not content:
+        return ""
+    if _AGY_TASK_SENDER_RE.search(meta):
+        return ""
+    if content.startswith('Task id "') and "finished with result:" in content:
+        return ""
+    return content
+
+
 def _connect_readonly_sqlite(path: Path) -> sqlite3.Connection:
     uri = path.resolve().as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=2.0)
@@ -295,6 +329,10 @@ def _synthesize_summary_from_transcript(thread_id: str, t_path: Path, home: Path
             cleaned = clean_user_input_text(step.get("content") or "")
             if cleaned and not first_user:
                 first_user = cleaned
+        elif step.get("type") == "SYSTEM_MESSAGE":
+            msg_text = extract_antigravity_message_input(step)
+            if msg_text and not first_user:
+                first_user = msg_text
         elif step.get("type") == "PLANNER_RESPONSE":
             if step.get("model"):
                 last_model = str(step.get("model") or "").strip()
@@ -519,10 +557,12 @@ def build_thread_from_antigravity(
         step_source = str(step.get("source") or "")
         ts = parse_iso_timestamp(step.get("created_at"))
 
+        user_text = ""
         if step_type == "USER_INPUT" and step_source == "USER_EXPLICIT":
             user_text = clean_user_input_text(step.get("content") or "")
-            if not user_text:
-                continue
+        elif step_type == "SYSTEM_MESSAGE":
+            user_text = extract_antigravity_message_input(step)
+        if user_text:
             if current_turn is not None:
                 current_turn["status"] = "completed"
                 turns.append(current_turn)
@@ -540,6 +580,8 @@ def build_thread_from_antigravity(
                     }
                 ],
             }
+            continue
+        if step_type == "USER_INPUT" and step_source == "USER_EXPLICIT":
             continue
 
         if current_turn is None:

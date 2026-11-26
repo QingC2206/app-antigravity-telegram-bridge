@@ -10,6 +10,7 @@ from typing import Any
 
 from antigravity_telegram_bridge.codex.antigravity_store import (
     clean_user_input_text,
+    extract_antigravity_message_input,
     parse_iso_timestamp,
     read_transcript_steps,
 )
@@ -95,27 +96,31 @@ def read_receipts(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
             continue
         if not isinstance(record, dict):
             continue
-        # Antigravity transcript.jsonl format
+        # Antigravity transcript.jsonl format (direct user input or agentapi send-message)
+        agy_text = ""
         if record.get("type") == "USER_INPUT" and record.get("source") in {"USER_EXPLICIT", "USER"}:
-            raw_content = str(record.get("content") or "")
-            cleaned = clean_user_input_text(raw_content)
-            if cleaned:
-                step_idx = record.get("step_index", 0)
-                turn_id = f"turn-{step_idx}"
-                item_id = f"item-{step_idx}"
-                created_raw = record.get("created_at")
-                created_ts = (
-                    float(created_raw)
-                    if isinstance(created_raw, (int, float))
-                    else (parse_iso_timestamp(created_raw) or 0.0)
-                )
-                receipts.append({
-                    "item_id": item_id,
-                    "turn_id": turn_id,
-                    "created": created_ts,
-                    "origin": "user",
-                    "digest": prompt_digest("", cleaned),
-                })
+            agy_text = clean_user_input_text(str(record.get("content") or ""))
+        elif record.get("type") == "SYSTEM_MESSAGE":
+            agy_text = extract_antigravity_message_input(record)
+        if agy_text:
+            step_idx = record.get("step_index", 0)
+            turn_id = f"turn-{step_idx}"
+            item_id = f"item-{step_idx}"
+            created_raw = record.get("created_at")
+            created_ts = (
+                float(created_raw)
+                if isinstance(created_raw, (int, float))
+                else (parse_iso_timestamp(created_raw) or 0.0)
+            )
+            receipts.append({
+                "item_id": item_id,
+                "turn_id": turn_id,
+                "created": created_ts,
+                "origin": "user",
+                "digest": prompt_digest("", agy_text),
+            })
+            continue
+        if record.get("type") == "USER_INPUT" and record.get("source") in {"USER_EXPLICIT", "USER"}:
             continue
         payload = record.get("payload")
         if not isinstance(payload, dict) or record.get("type") != "response_item":
@@ -158,7 +163,10 @@ def completion_turn(thread_id: str, final_message: Any, sessions: Path) -> str:
         matches = set()
         current_agy_turn = ""
         for record in read_transcript_steps(thread_id, explicit_path=path):
-            if record.get("type") == "USER_INPUT" and record.get("source") in {"USER_EXPLICIT", "USER"}:
+            if (
+                (record.get("type") == "USER_INPUT" and record.get("source") in {"USER_EXPLICIT", "USER"})
+                or extract_antigravity_message_input(record)
+            ):
                 current_agy_turn = f"turn-{record.get('step_index', 0)}"
             elif (
                 record.get("type") == "PLANNER_RESPONSE"
@@ -182,7 +190,10 @@ def completion_turn(thread_id: str, final_message: Any, sessions: Path) -> str:
             continue
         if not isinstance(record, dict):
             continue
-        if record.get("type") == "USER_INPUT" and record.get("source") in {"USER_EXPLICIT", "USER"}:
+        if (
+            (record.get("type") == "USER_INPUT" and record.get("source") in {"USER_EXPLICIT", "USER"})
+            or extract_antigravity_message_input(record)
+        ):
             current_agy_turn = f"turn-{record.get('step_index', 0)}"
             continue
         if (record.get("type") == "PLANNER_RESPONSE"

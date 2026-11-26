@@ -51,9 +51,35 @@ _APP_TOOLS_PIPE = re.compile(
 )
 
 
+def _is_antigravity_root_record(record: Any) -> bool:
+    if not isinstance(record, dict):
+        return False
+    exe_name = Path(str(record.get("ExecutablePath") or "")).name.lower()
+    return exe_name in {"antigravity.exe", "antigravity"}
+
+
 def discover_desktop(expected_home: Path | None = None) -> DesktopEndpoint:
     expected = (expected_home or codex_home()).resolve()
-    roots = _desktop_roots()
+    if has_antigravity_data(expected):
+        # Antigravity communicates via local storage + Language Server/agentapi,
+        # never Codex's PEB-advertised named pipe. Skipping cross-process PEB
+        # reads prevents unrelated co-installed Codex Store apps or Electron
+        # sidecar processes from breaking Antigravity discovery.
+        pid = os.getpid()
+        try:
+            roots = _desktop_roots()
+        except Exception:
+            roots = []
+        agy_pids = sorted(
+            int(record["ProcessId"])
+            for record in roots
+            if _is_antigravity_root_record(record) and record.get("ProcessId") is not None
+        )
+        if agy_pids:
+            pid = agy_pids[0]
+        return DesktopEndpoint(pid, ANTIGRAVITY_LOCAL_PIPE, expected, ())
+
+    roots = [r for r in _desktop_roots() if not _is_antigravity_root_record(r)]
     candidates = []
     other_profiles = set()
     for record in roots:

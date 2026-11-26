@@ -56,13 +56,33 @@ def desktop_resources(executable: Path) -> Path | None:
     return resources
 
 
+def _is_electron_node_helper(cmdline) -> bool:
+    if not cmdline or len(cmdline) < 2:
+        return False
+    node_flags = ('--import', '--loader', '--require', '-r', '-e', '--eval', '-p', '--print')
+    node_prefixes = ('--import=', '--loader=', '--require=', '--eval=', '--experimental-')
+    for raw_arg in cmdline[1:]:
+        arg = str(raw_arg or '').strip()
+        if not arg:
+            continue
+        lower = arg.lower()
+        if lower in node_flags or lower.startswith(node_prefixes):
+            return True
+        if not arg.startswith('-') and lower.endswith(('.js', '.mjs', '.cjs')):
+            return True
+    return False
+
+
 def desktop_roots():
     records = []
     for process in psutil.process_iter(['pid', 'exe', 'cmdline', 'uids']):
         info = process.info
         if not info['exe'] or not info['uids'] or info['uids'].real != os.getuid():
             continue
-        if any(arg.startswith('--type=') for arg in (info['cmdline'] or [])):
+        cmdline = info['cmdline'] or []
+        if any(str(arg).startswith('--type=') for arg in cmdline):
+            continue
+        if Path(info['exe']).name.lower() == 'antigravity' and _is_electron_node_helper(cmdline):
             continue
         resources = desktop_resources(Path(info['exe']))
         if resources:

@@ -416,7 +416,7 @@ class CodexAppServer:
                 cwd = meta.get("cwd") or str(Path.home())
                 model = str(meta.get("model") or "").strip()
                 args = [f"--model={model}"] if model else []
-                args.append(text)
+                args.extend(["--", text])
                 try:
                     res = run_agentapi("new-conversation", args, cwd=cwd, timeout=timeout)
 

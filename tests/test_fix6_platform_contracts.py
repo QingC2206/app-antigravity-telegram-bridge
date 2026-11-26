@@ -27,11 +27,76 @@ class PlatformRuleTests(unittest.TestCase):
         import psutil
         with tempfile.TemporaryDirectory() as folder:
             exe=Path(folder)/'WindowsApps/OpenAI.Codex_fixture/app/ChatGPT.exe'
+            agy=Path(folder)/'antigravity/Antigravity.exe'
             records=[Mock(info={'pid':1,'exe':str(exe),'cmdline':[str(exe)]}),
                      Mock(info={'pid':2,'exe':str(exe),'cmdline':[str(exe),'--type=renderer']}),
-                     Mock(info={'pid':3,'exe':str(Path(folder)/'vscode/ChatGPT.exe'),'cmdline':[]})]
+                     Mock(info={'pid':3,'exe':str(Path(folder)/'vscode/ChatGPT.exe'),'cmdline':[]}),
+                     Mock(info={'pid':4,'exe':str(agy),'cmdline':[str(agy),'--import=file:///sidecar_sdk/register_loader.js','main.mjs']}),
+                     Mock(info={'pid':5,'exe':str(agy),'cmdline':[str(agy),'--remote-debugging-port=0']})]
             with patch.object(psutil,'process_iter',return_value=records):
-                self.assertEqual(discovery.desktop_roots(),[{'ProcessId':1,'ExecutablePath':str(exe.resolve())}])
+                self.assertEqual(
+                    discovery.desktop_roots(),
+                    [
+                        {'ProcessId':1,'ExecutablePath':str(exe.resolve())},
+                        {'ProcessId':5,'ExecutablePath':str(agy.resolve())},
+                    ],
+                )
+
+    def test_windows_process_environment_reads_within_page_boundaries(self):
+        from antigravity_telegram_bridge.platforms.windows import discovery
+        import struct
+
+        peb_addr = 0x100000
+        params_addr = 0x200000
+        # Place environment block 128 bytes before a 4096-byte page boundary (0x301000)
+        # so any naive 1024-byte ReadProcessMemory crosses into the unmapped page and fails.
+        env_addr = 0x300F80
+        page_end = 0x301000
+        env_bytes = "CODEX_HOME=C:\\codex\0USERPROFILE=C:\\Users\\dev\0\0".encode("utf-16-le")
+        self.assertLessEqual(len(env_bytes), page_end - env_addr)
+
+        memory = {
+            (peb_addr + 0x20, 8): struct.pack("<Q", params_addr),
+            (params_addr + 0x80, 8): struct.pack("<Q", env_addr),
+        }
+
+        kernel = Mock()
+        ntdll = Mock()
+        kernel.OpenProcess.return_value = 99
+
+        def fake_nt_query(handle, info_class, buf_ptr, buf_len, ret_len):
+            buf_ptr._obj.peb = peb_addr
+            return 0
+
+        def fake_read(handle, address, buffer, size, received):
+            if (address, size) in memory:
+                data = memory[(address, size)]
+                ctypes.memmove(buffer, data, len(data))
+                received._obj.value = len(data)
+                return True
+            if address >= env_addr and address + size <= page_end:
+                offset = address - env_addr
+                slice_bytes = env_bytes[offset:offset + size]
+                padded = slice_bytes.ljust(size, b"\0")
+                ctypes.memmove(buffer, padded, len(padded))
+                received._obj.value = len(padded)
+                return True
+            # Crossing page_end simulates Windows ERROR_PARTIAL_COPY with 0 bytes received.
+            received._obj.value = 0
+            return False
+
+        ntdll.NtQueryInformationProcess.side_effect = fake_nt_query
+        kernel.ReadProcessMemory.side_effect = fake_read
+
+        def fake_windll(name, **kwargs):
+            return kernel if name == "kernel32" else ntdll
+
+        with patch.object(discovery, "os", SimpleNamespace(name="nt")), \
+             patch.object(discovery.struct, "calcsize", return_value=8), \
+             patch.object(ctypes, "WinDLL", side_effect=fake_windll, create=True):
+            result = discovery._process_environment(44)
+        self.assertEqual(result, {"CODEX_HOME": "C:\\codex", "USERPROFILE": "C:\\Users\\dev"})
+        kernel.CloseHandle.assert_called_once_with(99)
 
     def test_windows_pipe_server_pid_api_mismatch_and_denial_fail_closed(self):
         from antigravity_telegram_bridge.platforms.windows import discovery

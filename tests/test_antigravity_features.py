@@ -845,6 +845,111 @@ class AntigravityStoreAndArtifactsTests(unittest.TestCase):
             self.assertEqual(rc_un, 0)
             self.assertFalse(sc_file.exists())
 
+    def test_discover_desktop_antigravity_skips_peb_reads_and_ignores_coinstalled_codex(self):
+        from antigravity_telegram_bridge.codex import desktop
+        from antigravity_telegram_bridge.codex.errors import DesktopBridgeSafetyError
+
+        fake_roots = [
+            {"ProcessId": 53892, "ExecutablePath": r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0\app\ChatGPT.exe"},
+            {"ProcessId": 57932, "ExecutablePath": r"C:\Users\dev\AppData\Local\Programs\antigravity\Antigravity.exe"},
+            {"ProcessId": 59001, "ExecutablePath": r"C:\Users\dev\AppData\Local\Programs\antigravity\Antigravity.exe"},
+        ]
+        with patch.object(desktop, "_desktop_roots", return_value=fake_roots), \
+             patch.object(desktop, "_process_environment", side_effect=DesktopBridgeSafetyError("peb read denied")) as mock_peb:
+            endpoint = desktop.discover_desktop(self.home)
+            self.assertEqual(endpoint.pipe, desktop.ANTIGRAVITY_LOCAL_PIPE)
+            self.assertEqual(endpoint.pid, 57932)
+            self.assertEqual(endpoint.profile, self.home.resolve())
+            mock_peb.assert_not_called()
+
+    def test_agentapi_system_message_creates_turn_and_matches_receipts(self):
+        t_path = self.home / "brain" / self.thread_id / ".system_generated" / "logs" / "transcript.jsonl"
+        extra_steps = [
+            {
+                "step_index": 2,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "created_at": "2026-11-26T00:50:00Z",
+                "content": (
+                    "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n"
+                    "<SYSTEM_MESSAGE>\n"
+                    "[Message] timestamp=2026-11-26T00:50:00Z sender=conv-1/task-82 priority=MESSAGE_PRIORITY_HIGH "
+                    'content=Task id "conv-1/task-82" finished with result: ok\n'
+                    "</SYSTEM_MESSAGE>"
+                ),
+            },
+            {
+                "step_index": 3,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "created_at": "2026-11-26T00:55:00Z",
+                "content": (
+                    "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n"
+                    "<SYSTEM_MESSAGE>\n"
+                    "Reminder: work efficiently.\n"
+                    "</SYSTEM_MESSAGE>"
+                ),
+            },
+            {
+                "step_index": 4,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "created_at": "2026-11-26T00:57:25Z",
+                "content": (
+                    "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n"
+                    "<SYSTEM_MESSAGE>\n"
+                    "[Message] timestamp=2026-11-26T00:57:25Z sender=external priority=MESSAGE_PRIORITY_HIGH "
+                    "content=复检没有问题，可以关闭，提交并推送。\n"
+                    "</SYSTEM_MESSAGE>"
+                ),
+            },
+            {
+                "step_index": 5,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-26T00:57:29Z",
+                "model": "gemini-4-neon-xhigh",
+                "content": "已提交并推送完成。",
+            },
+        ]
+        with t_path.open("a", encoding="utf-8") as fh:
+            for step in extra_steps:
+                fh.write(json.dumps(step, ensure_ascii=False) + "\n")
+
+        thread = agy_store.build_thread_from_antigravity(self.thread_id, home=self.home, include_turns=True)
+        self.assertIsNotNone(thread)
+        turns = thread["turns"]
+        # Only step 0 (USER_INPUT) and step 4 (agentapi [Message]) create turns; task notification & reminder do not.
+        self.assertEqual([t["id"] for t in turns], ["turn-0", "turn-4"])
+        user_msg = turns[1]["items"][0]
+        self.assertEqual(user_msg["type"], "userMessage")
+        self.assertEqual(user_msg["content"][0]["text"], "复检没有问题，可以关闭，提交并推送。")
+
+        # Receipts match the exact Telegram follow-up digest and turn_id.
+        found, _ = receipts.read_receipts(t_path, 0)
+        expected_digest = receipts.prompt_digest("", "复检没有问题，可以关闭，提交并推送。")
+        matched = [r for r in found if r["digest"] == expected_digest]
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["turn_id"], "turn-4")
+        self.assertEqual(matched[0]["item_id"], "item-4")
+
+        # completion_turn and Stop hook normalization attribute the new reply to turn-4, never stale turn-0.
+        self.assertEqual(
+            receipts.completion_turn(self.thread_id, "已提交并推送完成。", self.home / "sessions"),
+            "turn-4",
+        )
+        normalized = agy_store.normalize_antigravity_hook_payload(
+            {"conversationId": self.thread_id, "terminationReason": "DONE"},
+            home=self.home,
+            data=self.data,
+        )
+        self.assertEqual(normalized["turn_id"], "turn-4")
+        self.assertEqual(normalized["last_assistant_message"], "已提交并推送完成。")
+
 
 if __name__ == "__main__":
     unittest.main()
